@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
+  BarChart3,
   BellRing,
   CalendarDays,
   CheckCircle2,
@@ -12,19 +13,21 @@ import {
   FileSpreadsheet,
   HardDriveDownload,
   LayoutDashboard,
+  Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
   Save,
   ShieldCheck,
+  Settings2,
   WalletCards,
   X,
 } from "lucide-react";
 import "./App.css";
 
-type View = "overview" | "holdings" | "transactions" | "calendar";
+type View = "overview" | "holdings" | "transactions" | "calendar" | "analytics" | "masterData";
 type CurrencyCode = "CNY" | "USD";
-type EntryOperation = "BUY" | "SELL" | "PRODUCT_MATURITY" | "VALUATION" | "DEPOSIT_OPEN" | "DEPOSIT_MATURITY";
+type EntryOperation = "BUY" | "SELL" | "PRODUCT_MATURITY" | "VALUATION" | "DIVIDEND" | "FEE" | "TRANSFER" | "DEPOSIT_OPEN" | "DEPOSIT_MATURITY";
 
 type CurrencySummary = {
   currency: CurrencyCode;
@@ -86,6 +89,7 @@ type EntryInput = {
   operation: EntryOperation;
   productId: number | null;
   accountId: number | null;
+  transferAccountId: number | null;
   depositId: number | null;
   productName: string | null;
   productCode: string | null;
@@ -101,6 +105,31 @@ type EntryInput = {
 
 type EntryResult = { message: string; realizedGain: number | null };
 type FileOperationResult = { path: string; message: string };
+
+type AccountRecord = { id: number; institution: string; name: string; currency: CurrencyCode; source: string };
+type ProductRecord = { id: number; code: string; name: string; currency: CurrencyCode; issuer: string | null; riskLevel: string | null; source: string };
+type DepositRecord = { id: number; accountId: number; institution: string; name: string; currency: CurrencyCode; principal: number; startDate: string | null; maturityDate: string; annualRate: number; status: string; source: string };
+type MasterData = { accounts: AccountRecord[]; products: ProductRecord[]; deposits: DepositRecord[] };
+type EditableRecord = { entityType: "account"; record: AccountRecord } | { entityType: "product"; record: ProductRecord } | { entityType: "deposit"; record: DepositRecord };
+type MasterDataUpdate = {
+  entityType: EditableRecord["entityType"];
+  id: number;
+  name: string;
+  code: string | null;
+  institution: string | null;
+  accountId: number | null;
+  currency: CurrencyCode;
+  issuer: string | null;
+  riskLevel: string | null;
+  principal: number | null;
+  startDate: string | null;
+  maturityDate: string | null;
+  annualRate: number | null;
+};
+
+type TrendPoint = { date: string; label: string; assetValue: number; cumulativeRealizedGain: number; netCashFlow: number };
+type CurrencyAnalytics = { currency: CurrencyCode; xirr: number | null; currentValue: number; unrealizedGain: number; realizedGain: number; income: number; fees: number; trend: TrendPoint[] };
+type Analytics = { asOfDate: string; currencies: CurrencyAnalytics[] };
 
 type MaturityEvent = {
   id: number;
@@ -133,11 +162,16 @@ const EMPTY_DASHBOARD: Dashboard = {
   warningCount: 0,
 };
 
+const EMPTY_MASTER_DATA: MasterData = { accounts: [], products: [], deposits: [] };
+const EMPTY_ANALYTICS: Analytics = { asOfDate: new Date().toISOString().slice(0, 10), currencies: [] };
+
 const viewTitles: Record<View, string> = {
   overview: "资产总览",
   holdings: "当前持仓",
   transactions: "交易流水",
   calendar: "到期日历",
+  analytics: "收益分析",
+  masterData: "资料管理",
 };
 
 function formatMoney(value: number, currency: CurrencyCode) {
@@ -159,6 +193,8 @@ function App() {
   const [holdings, setHoldings] = useState<Holding[]>([]);
   const [maturities, setMaturities] = useState<MaturityEvent[]>([]);
   const [transactions, setTransactions] = useState<TransactionRecord[]>([]);
+  const [masterData, setMasterData] = useState<MasterData>(EMPTY_MASTER_DATA);
+  const [analytics, setAnalytics] = useState<Analytics>(EMPTY_ANALYTICS);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -167,21 +203,26 @@ function App() {
   const [dataOpen, setDataOpen] = useState(false);
   const [transactionDetail, setTransactionDetail] = useState<TransactionDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [editingRecord, setEditingRecord] = useState<EditableRecord | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [nextDashboard, nextHoldings, nextMaturities, nextTransactions] = await Promise.all([
+      const [nextDashboard, nextHoldings, nextMaturities, nextTransactions, nextMasterData, nextAnalytics] = await Promise.all([
         invoke<Dashboard>("get_dashboard"),
         invoke<Holding[]>("list_holdings"),
         invoke<MaturityEvent[]>("list_maturities"),
         invoke<TransactionRecord[]>("list_transactions"),
+        invoke<MasterData>("list_master_data"),
+        invoke<Analytics>("get_analytics"),
       ]);
       setDashboard(nextDashboard);
       setHoldings(nextHoldings);
       setMaturities(nextMaturities);
       setTransactions(nextTransactions);
+      setMasterData(nextMasterData);
+      setAnalytics(nextAnalytics);
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -334,6 +375,21 @@ function App() {
     }
   };
 
+  const saveMasterData = async (input: MasterDataUpdate) => {
+    setError(null);
+    setLoading(true);
+    try {
+      const result = await invoke<EntryResult>("update_master_data", { input });
+      setNotice(result.message);
+      setEditingRecord(null);
+      await refresh();
+    } catch (reason) {
+      setError(String(reason));
+      setLoading(false);
+      throw reason;
+    }
+  };
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -346,6 +402,8 @@ function App() {
           <NavButton active={view === "holdings"} onClick={() => setView("holdings")} icon={<WalletCards />} label="持仓" />
           <NavButton active={view === "transactions"} onClick={() => setView("transactions")} icon={<ClipboardList />} label="交易流水" />
           <NavButton active={view === "calendar"} onClick={() => setView("calendar")} icon={<CalendarDays />} label="到期日历" />
+          <NavButton active={view === "analytics"} onClick={() => setView("analytics")} icon={<BarChart3 />} label="收益分析" />
+          <NavButton active={view === "masterData"} onClick={() => setView("masterData")} icon={<Settings2 />} label="资料管理" />
         </nav>
         <div className="privacy-note"><ShieldCheck /><span>数据仅保存在本机<br />SQLite 自动持久化</span></div>
       </aside>
@@ -385,6 +443,8 @@ function App() {
             {view === "holdings" && <HoldingsView holdings={holdings} />}
             {view === "transactions" && <TransactionsView transactions={transactions} onSelect={(id) => void openTransaction(id)} loading={detailLoading} />}
             {view === "calendar" && <CalendarView groups={groupedMaturities} />}
+            {view === "analytics" && <AnalyticsView analytics={analytics} currency={currency} onCurrencyChange={setCurrency} />}
+            {view === "masterData" && <MasterDataView data={masterData} onEdit={setEditingRecord} />}
           </>
         )}
       </main>
@@ -410,6 +470,7 @@ function App() {
         <EntryModal
           holdings={holdings}
           deposits={maturities}
+          accounts={masterData.accounts}
           onClose={() => setEntryOpen(false)}
           onSave={saveEntry}
         />
@@ -428,6 +489,14 @@ function App() {
           detail={transactionDetail}
           onClose={() => setTransactionDetail(null)}
           onReverse={(id) => void reverseTransaction(id)}
+        />
+      )}
+      {editingRecord && (
+        <MasterDataEditModal
+          target={editingRecord}
+          accounts={masterData.accounts}
+          onClose={() => setEditingRecord(null)}
+          onSave={saveMasterData}
         />
       )}
     </div>
@@ -511,6 +580,65 @@ function CalendarView({ groups }: { groups: Record<string, MaturityEvent[]> }) {
   return <section className="calendar-list">{Object.entries(groups).map(([month, events]) => <article className="panel month-panel" key={month}><div className="month-title"><h2>{month.replace("-", "年")}月</h2><span>{events.length}笔到期</span></div><div className="timeline">{events.map((item) => <div className="timeline-item" key={item.id}><time>{item.maturityDate.slice(5)}</time><div><strong>{item.name}</strong><span>{item.institution} · 年利率 {formatPercent(item.annualRate)}</span></div><b>{formatMoney(item.amount, item.currency)}</b></div>)}</div></article>)}</section>;
 }
 
+function TrendChart({ points, field, currency, color }: { points: TrendPoint[]; field: "assetValue" | "cumulativeRealizedGain"; currency: CurrencyCode; color: string }) {
+  const width = 760;
+  const height = 220;
+  const padX = 28;
+  const padTop = 18;
+  const padBottom = 35;
+  const values = points.map((item) => item[field]);
+  const rawMin = Math.min(0, ...values);
+  const rawMax = Math.max(0, ...values);
+  const span = Math.max(rawMax - rawMin, 1);
+  const x = (index: number) => padX + index * ((width - padX * 2) / Math.max(points.length - 1, 1));
+  const y = (value: number) => padTop + (rawMax - value) / span * (height - padTop - padBottom);
+  const path = points.map((item, index) => `${x(index)},${y(item[field])}`).join(" ");
+  return (
+    <div className="trend-chart">
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={field === "assetValue" ? "资产变化趋势" : "累计收益趋势"}>
+        <line x1={padX} y1={y(0)} x2={width - padX} y2={y(0)} className="chart-zero" />
+        <polyline points={path} fill="none" stroke={color} strokeWidth="3" strokeLinejoin="round" strokeLinecap="round" />
+        {points.map((item, index) => <g key={item.date}><circle cx={x(index)} cy={y(item[field])} r="3.5" fill={color}><title>{item.date} · {formatMoney(item[field], currency)}</title></circle><text x={x(index)} y={height - 10} textAnchor="middle">{item.label}</text></g>)}
+      </svg>
+      <div className="chart-range"><span>{formatMoney(rawMin, currency)}</span><span>{formatMoney(rawMax, currency)}</span></div>
+    </div>
+  );
+}
+
+function AnalyticsView({ analytics, currency, onCurrencyChange }: { analytics: Analytics; currency: CurrencyCode; onCurrencyChange: (value: CurrencyCode) => void }) {
+  const data = analytics.currencies.find((item) => item.currency === currency);
+  if (!data) return <article className="panel"><p className="muted">暂无可分析数据</p></article>;
+  return (
+    <>
+      <div className="analysis-toolbar"><div className="segmented"><button className={currency === "CNY" ? "active" : ""} onClick={() => onCurrencyChange("CNY")}>人民币</button><button className={currency === "USD" ? "active" : ""} onClick={() => onCurrencyChange("USD")}>美元</button></div><span>统计截至 {analytics.asOfDate} · XIRR 按实际日期现金流计算</span></div>
+      <section className="metrics-grid analysis-metrics">
+        <Metric label="当前资产" value={formatMoney(data.currentValue, currency)} detail="理财市值 + 有效定存本金" />
+        <Metric label="年化收益率 XIRR" value={data.xirr === null ? "数据不足" : formatPercent(data.xirr)} detail="不完整历史不会强行估算" positive={data.xirr === null ? undefined : data.xirr >= 0} />
+        <Metric label="累计已实现收益" value={formatMoney(data.realizedGain, currency)} detail={`分红 ${formatMoney(data.income, currency)} · 费用 ${formatMoney(data.fees, currency)}`} positive={data.realizedGain >= 0} />
+        <Metric label="当前持有收益" value={formatMoney(data.unrealizedGain, currency)} detail="当前市值减剩余持仓成本" positive={data.unrealizedGain >= 0} />
+      </section>
+      <section className="analysis-grid">
+        <article className="panel"><div className="panel-header"><h2>资产变化</h2><span>近12个月月末值</span></div><TrendChart points={data.trend} field="assetValue" currency={currency} color="#2e7d55" /></article>
+        <article className="panel"><div className="panel-header"><h2>累计已实现收益</h2><span>赎回收益、利息、分红与费用</span></div><TrendChart points={data.trend} field="cumulativeRealizedGain" currency={currency} color="#bd7c2e" /></article>
+      </section>
+      <article className="panel cash-flow-panel"><div className="panel-header"><h2>月度现金流</h2><span>正数为回款，负数为投入或费用；内部转账已排除</span></div><div className="cash-flow-list">{data.trend.map((item) => <div key={item.date}><span>{item.label}</span><div className="flow-track"><i className={item.netCashFlow >= 0 ? "positive" : "negative"} style={{ width: `${Math.min(100, Math.abs(item.netCashFlow) / Math.max(...data.trend.map((point) => Math.abs(point.netCashFlow)), 1) * 100)}%` }} /></div><strong className={item.netCashFlow >= 0 ? "gain" : "loss"}>{formatMoney(item.netCashFlow, currency)}</strong></div>)}</div></article>
+      <div className="calculation-note analysis-note">XIRR 仅使用日期和方向明确的买入、卖出、到期、分红及费用流水，并加入当前理财市值。缺少开户日期的历史导入定存不会加入 XIRR，以避免虚高结果。</div>
+    </>
+  );
+}
+
+function MasterDataView({ data, onEdit }: { data: MasterData; onEdit: (target: EditableRecord) => void }) {
+  const [section, setSection] = useState<"products" | "accounts" | "deposits">("products");
+  return (
+    <article className="panel table-panel master-panel">
+      <div className="panel-header"><div><h2>资料管理</h2><span>修改会自动备份并保留变更审计；手工修正不会被下次导入覆盖</span></div><div className="segmented"><button className={section === "products" ? "active" : ""} onClick={() => setSection("products")}>产品 {data.products.length}</button><button className={section === "accounts" ? "active" : ""} onClick={() => setSection("accounts")}>账户 {data.accounts.length}</button><button className={section === "deposits" ? "active" : ""} onClick={() => setSection("deposits")}>存款 {data.deposits.length}</button></div></div>
+      {section === "products" && <div className="table-scroll"><table><thead><tr><th>产品</th><th>币种</th><th>发行机构</th><th>风险等级</th><th>来源</th><th /></tr></thead><tbody>{data.products.map((item) => <tr key={item.id}><td><strong>{item.name}</strong><span>{item.code}</span></td><td>{item.currency}</td><td>{item.issuer ?? "—"}</td><td>{item.riskLevel ?? "—"}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "product", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
+      {section === "accounts" && <div className="table-scroll"><table><thead><tr><th>账户</th><th>币种</th><th>来源</th><th /></tr></thead><tbody>{data.accounts.map((item) => <tr key={item.id}><td><strong>{item.institution}</strong><span>{item.name}</span></td><td>{item.currency}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "account", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
+      {section === "deposits" && <div className="table-scroll"><table><thead><tr><th>存款</th><th>账户</th><th>币种</th><th className="number">本金</th><th>到期日</th><th>年利率</th><th>状态</th><th /></tr></thead><tbody>{data.deposits.map((item) => <tr key={item.id}><td><strong>{item.name}</strong><span>{item.source === "excel" ? "Excel 导入" : "手工录入"}</span></td><td>{item.institution}</td><td>{item.currency}</td><td className="number">{formatMoney(item.principal, item.currency)}</td><td>{item.maturityDate}</td><td>{formatPercent(item.annualRate)}</td><td><span className="status">{item.status === "active" ? "持有中" : item.status === "matured" ? "已到期" : "已取消"}</span></td><td><button className="icon-button" onClick={() => onEdit({ entityType: "deposit", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
+    </article>
+  );
+}
+
 const operationLabels: Record<string, string> = {
   BUY: "买入",
   SELL: "卖出",
@@ -519,6 +647,9 @@ const operationLabels: Record<string, string> = {
   VALUATION: "更新市值",
   DEPOSIT_OPEN: "定存开户",
   DEPOSIT_MATURITY: "定存到期",
+  DIVIDEND: "分红",
+  FEE: "费用",
+  TRANSFER: "账户转账",
   REVERSAL: "冲销",
 };
 
@@ -532,11 +663,12 @@ function TransactionsView({ transactions, onSelect, loading }: {
       <div className="panel-header"><h2>交易流水</h2><span>最近{transactions.length}笔 · 买卖成本和已实现收益可追溯</span></div>
       <div className="table-scroll"><table><thead><tr><th>日期</th><th>操作</th><th>产品</th><th>币种</th><th className="number">现金金额</th><th className="number">核销成本</th><th className="number">已实现收益</th><th>备注</th></tr></thead><tbody>
         {transactions.map((item) => {
-          const incoming = ["SELL", "REDEEM", "PRODUCT_MATURITY", "DEPOSIT_MATURITY"].includes(item.operation);
+          const incoming = ["SELL", "REDEEM", "PRODUCT_MATURITY", "DEPOSIT_MATURITY", "DIVIDEND"].includes(item.operation);
           const cashless = item.operation === "VALUATION";
+          const neutral = ["REVERSAL", "TRANSFER"].includes(item.operation);
           const reversed = item.reversedBy !== null;
-          const hasRealized = (incoming || item.operation === "REVERSAL") && (item.operation !== "REDEEM" || Math.abs(item.realizedGain) > 0.000001);
-          return <tr className={`transaction-row ${reversed ? "reversed-row" : ""}`} key={item.id} onClick={() => onSelect(item.id)} aria-busy={loading}><td className="nowrap">{item.tradeDate}</td><td><span className={`operation-tag ${item.operation === "REVERSAL" ? "neutral" : incoming ? "incoming" : "outgoing"}`}>{operationLabels[item.operation] ?? item.operation}</span>{reversed && <span className="reversed-label">已冲销</span>}</td><td><strong>{item.title}</strong>{item.code && <span>{item.code}</span>}</td><td>{item.currency}</td><td className={`number ${incoming ? "gain" : ""}`}>{cashless ? "—" : <>{incoming ? "+" : item.operation === "REVERSAL" ? "±" : "-"}{formatMoney(item.amount, item.currency)}</>}</td><td className="number">{Math.abs(item.costBasis) > 0.000001 ? formatMoney(item.costBasis, item.currency) : "—"}</td><td className={`number ${item.realizedGain >= 0 ? "gain" : "loss"}`}>{hasRealized ? formatMoney(item.realizedGain, item.currency) : "—"}</td><td className="note-cell">{item.note ?? "—"}</td></tr>;
+          const hasRealized = (incoming || item.operation === "FEE" || item.operation === "REVERSAL") && (item.operation !== "REDEEM" || Math.abs(item.realizedGain) > 0.000001);
+          return <tr className={`transaction-row ${reversed ? "reversed-row" : ""}`} key={item.id} onClick={() => onSelect(item.id)} aria-busy={loading}><td className="nowrap">{item.tradeDate}</td><td><span className={`operation-tag ${neutral ? "neutral" : incoming ? "incoming" : "outgoing"}`}>{operationLabels[item.operation] ?? item.operation}</span>{reversed && <span className="reversed-label">已冲销</span>}</td><td><strong>{item.title}</strong>{item.code && <span>{item.code}</span>}</td><td>{item.currency}</td><td className={`number ${incoming ? "gain" : ""}`}>{cashless ? "—" : <>{incoming ? "+" : neutral ? "↔" : "-"}{formatMoney(item.amount, item.currency)}</>}</td><td className="number">{Math.abs(item.costBasis) > 0.000001 ? formatMoney(item.costBasis, item.currency) : "—"}</td><td className={`number ${item.realizedGain >= 0 ? "gain" : "loss"}`}>{hasRealized ? formatMoney(item.realizedGain, item.currency) : "—"}</td><td className="note-cell">{item.note ?? "—"}</td></tr>;
         })}
       </tbody></table></div>
     </article>
@@ -599,13 +731,74 @@ const entryOperations: { value: EntryOperation; label: string; help: string }[] 
   { value: "SELL", label: "卖出理财", help: "自动 FIFO 核销" },
   { value: "PRODUCT_MATURITY", label: "理财到期", help: "全部结清" },
   { value: "VALUATION", label: "更新市值", help: "保留历史快照" },
+  { value: "DIVIDEND", label: "收到分红", help: "计入已实现收益" },
+  { value: "FEE", label: "支付费用", help: "计入收益扣减" },
+  { value: "TRANSFER", label: "账户转账", help: "不影响总资产" },
   { value: "DEPOSIT_OPEN", label: "新增定存", help: "加入到期日历" },
   { value: "DEPOSIT_MATURITY", label: "定存到期", help: "拆分本金利息" },
 ];
 
-function EntryModal({ holdings, deposits, onClose, onSave }: {
+function MasterDataEditModal({ target, accounts, onClose, onSave }: { target: EditableRecord; accounts: AccountRecord[]; onClose: () => void; onSave: (input: MasterDataUpdate) => Promise<void> }) {
+  const record = target.record;
+  const product = target.entityType === "product" ? target.record : null;
+  const account = target.entityType === "account" ? target.record : null;
+  const deposit = target.entityType === "deposit" ? target.record : null;
+  const [name, setName] = useState(record.name);
+  const [code, setCode] = useState(product?.code ?? "");
+  const [institution, setInstitution] = useState(account?.institution ?? "");
+  const [currency, setCurrency] = useState<CurrencyCode>(record.currency);
+  const [issuer, setIssuer] = useState(product?.issuer ?? "");
+  const [riskLevel, setRiskLevel] = useState(product?.riskLevel ?? "");
+  const [accountId, setAccountId] = useState((deposit?.accountId ?? accounts.find((item) => item.currency === record.currency)?.id ?? 0).toString());
+  const [principal, setPrincipal] = useState(deposit?.principal.toString() ?? "");
+  const [startDate, setStartDate] = useState(deposit?.startDate ?? "");
+  const [maturityDate, setMaturityDate] = useState(deposit?.maturityDate ?? "");
+  const [annualRate, setAnnualRate] = useState(deposit ? (deposit.annualRate * 100).toString() : "");
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setSubmitting(true);
+    try {
+      await onSave({
+        entityType: target.entityType,
+        id: record.id,
+        name,
+        code: product ? code : null,
+        institution: account ? institution : null,
+        accountId: deposit ? Number(accountId) || null : null,
+        currency,
+        issuer: product ? issuer.trim() || null : null,
+        riskLevel: product ? riskLevel.trim() || null : null,
+        principal: deposit ? Number(principal) || null : null,
+        startDate: deposit ? startDate || null : null,
+        maturityDate: deposit ? maturityDate || null : null,
+        annualRate: deposit ? (Number(annualRate) || 0) / 100 : null,
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal edit-modal" role="dialog" aria-modal="true" aria-labelledby="edit-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-header"><div><h2 id="edit-title">编辑{target.entityType === "product" ? "产品" : target.entityType === "account" ? "账户" : "定期存款"}</h2><p>保存前自动备份，修改内容写入本地审计记录</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
+        <form className="entry-form edit-form" onSubmit={(event) => void submit(event)}>
+          <label className="full-field">名称<input required value={name} onChange={(event) => setName(event.target.value)} /></label>
+          {product && <><label>产品代码<input required value={code} onChange={(event) => setCode(event.target.value)} /></label><label>币种<select value={currency} onChange={(event) => setCurrency(event.target.value as CurrencyCode)}><option value="CNY">人民币 CNY</option><option value="USD">美元 USD</option></select></label><label>发行机构<input value={issuer} onChange={(event) => setIssuer(event.target.value)} /></label><label>风险等级<input value={riskLevel} onChange={(event) => setRiskLevel(event.target.value)} placeholder="例如 R2" /></label></>}
+          {account && <><label>银行/机构<input required value={institution} onChange={(event) => setInstitution(event.target.value)} /></label><label>币种<select value={currency} onChange={(event) => setCurrency(event.target.value as CurrencyCode)}><option value="CNY">人民币 CNY</option><option value="USD">美元 USD</option></select></label></>}
+          {deposit && <><label>存款账户<select required value={accountId} onChange={(event) => { setAccountId(event.target.value); const selected = accounts.find((item) => item.id.toString() === event.target.value); if (selected) setCurrency(selected.currency); }}><option value="">请选择</option>{accounts.map((item) => <option value={item.id} key={item.id}>{item.institution} · {item.name} · {item.currency}</option>)}</select></label><label>币种<input value={currency} disabled /></label><label>本金<input required type="number" min="0.01" step="0.01" value={principal} onChange={(event) => setPrincipal(event.target.value)} /></label><label>年利率（%）<input required type="number" min="0" max="100" step="0.01" value={annualRate} onChange={(event) => setAnnualRate(event.target.value)} /></label><label>起息日（可选）<input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} /></label><label>到期日<input required type="date" value={maturityDate} onChange={(event) => setMaturityDate(event.target.value)} /></label></>}
+          <div className="calculation-note full-field">已有账本记录的产品和账户不能修改币种；Excel 导入项目的手工修正会在后续导入时保留。</div>
+          <div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Save />{submitting ? "保存中…" : "保存修改"}</button></div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function EntryModal({ holdings, deposits, accounts, onClose, onSave }: {
   holdings: Holding[];
   deposits: MaturityEvent[];
+  accounts: AccountRecord[];
   onClose: () => void;
   onSave: (input: EntryInput) => Promise<void>;
 }) {
@@ -613,6 +806,8 @@ function EntryModal({ holdings, deposits, onClose, onSave }: {
   const [operation, setOperation] = useState<EntryOperation>("BUY");
   const [holdingChoice, setHoldingChoice] = useState("new");
   const [depositChoice, setDepositChoice] = useState(deposits[0]?.id.toString() ?? "");
+  const [sourceAccountChoice, setSourceAccountChoice] = useState(accounts[0]?.id.toString() ?? "");
+  const [targetAccountChoice, setTargetAccountChoice] = useState(accounts[1]?.id.toString() ?? "");
   const [name, setName] = useState("");
   const [code, setCode] = useState("");
   const [institution, setInstitution] = useState("");
@@ -627,7 +822,7 @@ function EntryModal({ holdings, deposits, onClose, onSave }: {
 
   const selectedHolding = holdings.find((item) => `${item.productId}:${item.accountId}` === holdingChoice);
   const selectedDeposit = deposits.find((item) => item.id.toString() === depositChoice);
-  const needsHolding = ["SELL", "PRODUCT_MATURITY", "VALUATION"].includes(operation);
+  const needsHolding = ["SELL", "PRODUCT_MATURITY", "VALUATION", "DIVIDEND", "FEE"].includes(operation);
   const isExistingBuy = operation === "BUY" && holdingChoice !== "new" && selectedHolding;
 
   const changeOperation = (next: EntryOperation) => {
@@ -647,12 +842,13 @@ function EntryModal({ holdings, deposits, onClose, onSave }: {
     const input: EntryInput = {
       operation,
       productId: operationHolding?.productId ?? null,
-      accountId: needsHolding ? operationHolding?.accountId ?? null : null,
+      accountId: operation === "TRANSFER" ? Number(sourceAccountChoice) || null : needsHolding ? operationHolding?.accountId ?? null : null,
+      transferAccountId: operation === "TRANSFER" ? Number(targetAccountChoice) || null : null,
       depositId: operation === "DEPOSIT_MATURITY" ? selectedDeposit?.id ?? null : null,
       productName: operation === "DEPOSIT_OPEN" || (operation === "BUY" && !isExistingBuy) ? name : null,
       productCode: operation === "BUY" && !isExistingBuy ? code : null,
       institution: operation === "BUY" ? (isExistingBuy ? selectedHolding.channel : institution) : operation === "DEPOSIT_OPEN" ? institution : null,
-      currency: operation === "BUY" ? (isExistingBuy ? selectedHolding.currency : currency) : operation === "DEPOSIT_OPEN" ? currency : operation === "DEPOSIT_MATURITY" ? selectedDeposit?.currency ?? null : selectedHolding?.currency ?? null,
+      currency: operation === "BUY" ? (isExistingBuy ? selectedHolding.currency : currency) : operation === "DEPOSIT_OPEN" ? currency : operation === "DEPOSIT_MATURITY" ? selectedDeposit?.currency ?? null : operation === "TRANSFER" ? accounts.find((item) => item.id.toString() === sourceAccountChoice)?.currency ?? null : selectedHolding?.currency ?? null,
       amount: operation === "VALUATION" ? null : Number(amount) || null,
       marketValue: operation === "VALUATION" ? Number(marketValue) || null : null,
       tradeDate,
@@ -679,11 +875,12 @@ function EntryModal({ holdings, deposits, onClose, onSave }: {
           {operation === "BUY" && <label className="full-field">产品<select value={holdingChoice} onChange={(event) => setHoldingChoice(event.target.value)}><option value="new">＋ 新理财产品</option>{holdings.map((item) => <option key={`${item.productId}:${item.accountId}`} value={`${item.productId}:${item.accountId}`}>{item.name} · {item.channel} · {item.currency}</option>)}</select></label>}
           {needsHolding && <label className="full-field">理财持仓<select required value={holdingChoice} onChange={(event) => setHoldingChoice(event.target.value)}><option value="">请选择</option>{holdings.map((item) => <option key={`${item.productId}:${item.accountId}`} value={`${item.productId}:${item.accountId}`}>{item.name} · {item.channel} · 市值 {formatMoney(item.marketValue, item.currency)}</option>)}</select></label>}
           {operation === "DEPOSIT_MATURITY" && <label className="full-field">到期存款<select required value={depositChoice} onChange={(event) => setDepositChoice(event.target.value)}><option value="">请选择</option>{deposits.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.maturityDate} · {formatMoney(item.amount, item.currency)}</option>)}</select></label>}
+          {operation === "TRANSFER" && <><label>转出账户<select required value={sourceAccountChoice} onChange={(event) => setSourceAccountChoice(event.target.value)}><option value="">请选择</option>{accounts.map((item) => <option key={item.id} value={item.id}>{item.institution} · {item.name} · {item.currency}</option>)}</select></label><label>转入账户<select required value={targetAccountChoice} onChange={(event) => setTargetAccountChoice(event.target.value)}><option value="">请选择</option>{accounts.filter((item) => item.id.toString() !== sourceAccountChoice).map((item) => <option key={item.id} value={item.id}>{item.institution} · {item.name} · {item.currency}</option>)}</select></label></>}
 
           {operation === "BUY" && !isExistingBuy && <><label className="full-field">产品名称<input required value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：稳富固收增强" /></label><label>产品代码<input required value={code} onChange={(event) => setCode(event.target.value)} /></label><label>购买渠道<input required value={institution} onChange={(event) => setInstitution(event.target.value)} placeholder="例如：中国银行" /></label><label>币种<select value={currency} onChange={(event) => setCurrency(event.target.value as CurrencyCode)}><option value="CNY">人民币 CNY</option><option value="USD">美元 USD</option></select></label></>}
           {operation === "DEPOSIT_OPEN" && <><label className="full-field">存款名称<input required value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：整存整取-3年" /></label><label>存款银行<input required value={institution} onChange={(event) => setInstitution(event.target.value)} /></label><label>币种<select value={currency} onChange={(event) => setCurrency(event.target.value as CurrencyCode)}><option value="CNY">人民币 CNY</option><option value="USD">美元 USD</option></select></label><label>到期日<input required type="date" value={maturityDate} onChange={(event) => setMaturityDate(event.target.value)} /></label><label>年利率（%）<input required type="number" min="0" max="100" step="0.01" value={annualRate} onChange={(event) => setAnnualRate(event.target.value)} placeholder="2.85" /></label></>}
 
-          {operation !== "VALUATION" && <label>{operation === "BUY" ? "买入金额" : operation === "DEPOSIT_OPEN" ? "存款本金" : "实际到账金额"}<input required type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} /></label>}
+          {operation !== "VALUATION" && <label>{operation === "BUY" ? "买入金额" : operation === "DEPOSIT_OPEN" ? "存款本金" : operation === "DIVIDEND" ? "分红金额" : operation === "FEE" ? "费用金额" : operation === "TRANSFER" ? "转账金额" : "实际到账金额"}<input required type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} /></label>}
           {operation === "VALUATION" && <label>当前总市值<input required type="number" min="0.01" step="0.01" value={marketValue} onChange={(event) => setMarketValue(event.target.value)} /></label>}
           <label>操作日期<input required type="date" value={tradeDate} onChange={(event) => setTradeDate(event.target.value)} /></label>
           <label className="full-field">备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="银行流水说明、确认号等" /></label>
@@ -691,6 +888,9 @@ function EntryModal({ holdings, deposits, onClose, onSave }: {
           {operation === "SELL" && selectedHolding && <div className="calculation-note full-field">将以当前市值 {formatMoney(selectedHolding.marketValue, selectedHolding.currency)} 为基准，按卖出比例计算应核销成本，并从最早的买入批次开始自动扣减。</div>}
           {operation === "PRODUCT_MATURITY" && selectedHolding && <div className="calculation-note full-field">将结清全部剩余成本 {formatMoney(selectedHolding.cost, selectedHolding.currency)}，到账金额与成本的差额计入已实现收益。</div>}
           {operation === "VALUATION" && <div className="calculation-note full-field">这里只更新产品总市值，不改变买入成本；旧市值会保留为历史快照。</div>}
+          {operation === "DIVIDEND" && <div className="calculation-note full-field">分红会计入已实现收益，不降低持仓成本，也不会自动修改当前市值。</div>}
+          {operation === "FEE" && <div className="calculation-note full-field">费用作为负收益记录，不改变持仓成本和当前市值。</div>}
+          {operation === "TRANSFER" && <div className="calculation-note full-field">账户间内部转账仅保留资金路径，不计入收益，也不改变当前统计的总资产。</div>}
 
           <div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Save />{submitting ? "保存中…" : "保存操作"}</button></div>
         </form>

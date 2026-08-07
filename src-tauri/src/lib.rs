@@ -1,5 +1,5 @@
 use calamine::{open_workbook_auto, Data, DataType, Reader};
-use chrono::{Duration, Local, NaiveDate};
+use chrono::{Datelike, Duration, Local, Months, NaiveDate};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction, MAIN_DB};
 use rust_xlsxwriter::{
     Color, ExcelDateTime, Format, FormatAlign, FormatBorder, Formula, Workbook, Worksheet,
@@ -62,6 +62,7 @@ struct EntryInput {
     operation: String,
     product_id: Option<i64>,
     account_id: Option<i64>,
+    transfer_account_id: Option<i64>,
     deposit_id: Option<i64>,
     product_name: Option<String>,
     product_code: Option<String>,
@@ -73,6 +74,100 @@ struct EntryInput {
     maturity_date: Option<String>,
     annual_rate: Option<f64>,
     note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountRecord {
+    id: i64,
+    institution: String,
+    name: String,
+    currency: String,
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductRecord {
+    id: i64,
+    code: String,
+    name: String,
+    currency: String,
+    issuer: Option<String>,
+    risk_level: Option<String>,
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DepositRecord {
+    id: i64,
+    account_id: i64,
+    institution: String,
+    name: String,
+    currency: String,
+    principal: f64,
+    start_date: Option<String>,
+    maturity_date: String,
+    annual_rate: f64,
+    status: String,
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MasterData {
+    accounts: Vec<AccountRecord>,
+    products: Vec<ProductRecord>,
+    deposits: Vec<DepositRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MasterDataUpdate {
+    entity_type: String,
+    id: i64,
+    name: String,
+    code: Option<String>,
+    institution: Option<String>,
+    account_id: Option<i64>,
+    currency: String,
+    issuer: Option<String>,
+    risk_level: Option<String>,
+    principal: Option<f64>,
+    start_date: Option<String>,
+    maturity_date: Option<String>,
+    annual_rate: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrendPoint {
+    date: String,
+    label: String,
+    asset_value: f64,
+    cumulative_realized_gain: f64,
+    net_cash_flow: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrencyAnalytics {
+    currency: String,
+    xirr: Option<f64>,
+    current_value: f64,
+    unrealized_gain: f64,
+    realized_gain: f64,
+    income: f64,
+    fees: f64,
+    trend: Vec<TrendPoint>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Analytics {
+    as_of_date: String,
+    currencies: Vec<CurrencyAnalytics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,6 +229,7 @@ struct ReversalIdentity {
     operation: String,
     product_id: Option<i64>,
     account_id: Option<i64>,
+    transfer_account_id: Option<i64>,
     deposit_id: Option<i64>,
     reversed_by: Option<i64>,
     source: String,
@@ -143,6 +239,7 @@ struct ReversalTarget {
     operation: String,
     product_id: Option<i64>,
     account_id: Option<i64>,
+    transfer_account_id: Option<i64>,
     deposit_id: Option<i64>,
     amount: f64,
     currency: String,
@@ -188,6 +285,8 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           name TEXT NOT NULL,
           currency TEXT NOT NULL,
           account_type TEXT NOT NULL DEFAULT 'bank',
+          import_institution TEXT,
+          is_user_edited INTEGER NOT NULL DEFAULT 0,
           source TEXT NOT NULL DEFAULT 'manual',
           UNIQUE(institution, name, currency)
         );
@@ -201,6 +300,8 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           currency TEXT NOT NULL,
           risk_level TEXT,
           liquidity_rule TEXT,
+          import_code TEXT,
+          is_user_edited INTEGER NOT NULL DEFAULT 0,
           source TEXT NOT NULL DEFAULT 'manual'
         );
 
@@ -208,6 +309,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           id INTEGER PRIMARY KEY,
           product_id INTEGER,
           account_id INTEGER,
+          transfer_account_id INTEGER,
           transaction_type TEXT NOT NULL,
           trade_date TEXT NOT NULL,
           amount REAL NOT NULL,
@@ -224,6 +326,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           source_row INTEGER,
           FOREIGN KEY(product_id) REFERENCES products(id),
           FOREIGN KEY(account_id) REFERENCES accounts(id),
+          FOREIGN KEY(transfer_account_id) REFERENCES accounts(id),
           FOREIGN KEY(deposit_id) REFERENCES deposits(id),
           FOREIGN KEY(reversal_of) REFERENCES transactions(id),
           FOREIGN KEY(reversed_by) REFERENCES transactions(id)
@@ -284,6 +387,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           status TEXT NOT NULL DEFAULT 'active',
           matured_at TEXT,
           proceeds REAL,
+          is_user_edited INTEGER NOT NULL DEFAULT 0,
           source TEXT NOT NULL DEFAULT 'manual',
           source_row INTEGER,
           FOREIGN KEY(account_id) REFERENCES accounts(id)
@@ -297,6 +401,15 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           holdings_imported INTEGER NOT NULL,
           deposits_imported INTEGER NOT NULL,
           warnings_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS master_data_changes (
+          id INTEGER PRIMARY KEY,
+          entity_type TEXT NOT NULL,
+          entity_id INTEGER NOT NULL,
+          changed_at TEXT NOT NULL,
+          before_json TEXT NOT NULL,
+          after_json TEXT NOT NULL
         );
         "#,
     )?;
@@ -313,6 +426,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "REAL NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "transactions", "deposit_id", "INTEGER")?;
+    ensure_column(conn, "transactions", "transfer_account_id", "INTEGER")?;
     ensure_column(conn, "transactions", "valuation_before", "REAL")?;
     ensure_column(conn, "transactions", "valuation_after", "REAL")?;
     ensure_column(conn, "transactions", "reversal_of", "INTEGER")?;
@@ -323,6 +437,26 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "deposits", "status", "TEXT NOT NULL DEFAULT 'active'")?;
     ensure_column(conn, "deposits", "matured_at", "TEXT")?;
     ensure_column(conn, "deposits", "proceeds", "REAL")?;
+    ensure_column(conn, "accounts", "import_institution", "TEXT")?;
+    ensure_column(
+        conn,
+        "accounts",
+        "is_user_edited",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(conn, "products", "import_code", "TEXT")?;
+    ensure_column(
+        conn,
+        "products",
+        "is_user_edited",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "deposits",
+        "is_user_edited",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     conn.execute(
         "UPDATE position_lots SET remaining_amount = original_amount WHERE remaining_amount IS NULL",
         [],
@@ -391,16 +525,25 @@ fn excel_date(cell: Option<&Data>) -> Option<NaiveDate> {
 }
 
 fn account_id(tx: &Transaction<'_>, institution: &str, currency: &str) -> rusqlite::Result<i64> {
+    let existing = tx
+        .query_row(
+            "SELECT id FROM accounts
+             WHERE currency = ?2 AND (
+               (institution = ?1 AND name = ?1) OR import_institution = ?1
+             ) ORDER BY is_user_edited DESC LIMIT 1",
+            params![institution, currency],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
     tx.execute(
-        "INSERT INTO accounts (institution, name, currency, source) VALUES (?1, ?1, ?2, 'excel')
-         ON CONFLICT(institution, name, currency) DO NOTHING",
+        "INSERT INTO accounts (institution, name, currency, import_institution, source)
+         VALUES (?1, ?1, ?2, ?1, 'excel')",
         params![institution, currency],
     )?;
-    tx.query_row(
-        "SELECT id FROM accounts WHERE institution = ?1 AND name = ?1 AND currency = ?2",
-        params![institution, currency],
-        |row| row.get(0),
-    )
+    Ok(tx.last_insert_rowid())
 }
 
 fn product_id(
@@ -409,16 +552,30 @@ fn product_id(
     name: &str,
     currency: &str,
 ) -> rusqlite::Result<i64> {
+    let existing: Option<(i64, bool)> = tx
+        .query_row(
+            "SELECT id, is_user_edited != 0 FROM products
+             WHERE code = ?1 OR import_code = ?1
+             ORDER BY is_user_edited DESC LIMIT 1",
+            params![code],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((id, edited)) = existing {
+        if !edited {
+            tx.execute(
+                "UPDATE products SET name = ?1 WHERE id = ?2",
+                params![name, id],
+            )?;
+        }
+        return Ok(id);
+    }
     tx.execute(
-        "INSERT INTO products (code, name, currency, source) VALUES (?1, ?2, ?3, 'excel')
-         ON CONFLICT(code) DO UPDATE SET name = excluded.name",
+        "INSERT INTO products (code, name, currency, import_code, source)
+         VALUES (?1, ?2, ?3, ?1, 'excel')",
         params![code, name, currency],
     )?;
-    tx.query_row(
-        "SELECT id FROM products WHERE code = ?1",
-        params![code],
-        |row| row.get(0),
-    )
+    Ok(tx.last_insert_rowid())
 }
 
 fn required_text(value: &Option<String>, label: &str) -> Result<String, String> {
@@ -838,6 +995,101 @@ fn apply_entry(conn: &mut Connection, input: &EntryInput) -> Result<EntryResult,
                 realized_gain: None,
             }
         }
+        "DIVIDEND" | "FEE" => {
+            let amount = positive_amount(
+                input.amount,
+                if operation == "DIVIDEND" {
+                    "分红金额"
+                } else {
+                    "费用金额"
+                },
+            )?;
+            let product = input
+                .product_id
+                .ok_or_else(|| "请选择理财产品".to_string())?;
+            let account = input
+                .account_id
+                .ok_or_else(|| "请选择购买渠道".to_string())?;
+            let currency = holding_currency(&tx, product, account)?;
+            let realized_gain = if operation == "DIVIDEND" {
+                amount
+            } else {
+                -amount
+            };
+            tx.execute(
+                "INSERT INTO transactions
+                   (product_id, account_id, transaction_type, trade_date, amount, currency,
+                    note, realized_gain, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'manual')",
+                params![
+                    product,
+                    account,
+                    operation,
+                    trade_date,
+                    amount,
+                    currency,
+                    input.note,
+                    realized_gain
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            EntryResult {
+                message: if operation == "DIVIDEND" {
+                    "分红已计入已实现收益，不改变持仓成本和市值".to_string()
+                } else {
+                    "费用已计入收益扣减，不改变持仓成本和市值".to_string()
+                },
+                realized_gain: Some(realized_gain),
+            }
+        }
+        "TRANSFER" => {
+            let amount = positive_amount(input.amount, "转账金额")?;
+            let source_account = input
+                .account_id
+                .ok_or_else(|| "请选择转出账户".to_string())?;
+            let target_account = input
+                .transfer_account_id
+                .ok_or_else(|| "请选择转入账户".to_string())?;
+            if source_account == target_account {
+                return Err("转入账户不能与转出账户相同".to_string());
+            }
+            let source_currency: String = tx
+                .query_row(
+                    "SELECT currency FROM accounts WHERE id = ?1",
+                    [source_account],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "没有找到转出账户".to_string())?;
+            let target_currency: String = tx
+                .query_row(
+                    "SELECT currency FROM accounts WHERE id = ?1",
+                    [target_account],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "没有找到转入账户".to_string())?;
+            if source_currency != target_currency {
+                return Err("当前只支持同币种账户之间转账".to_string());
+            }
+            tx.execute(
+                "INSERT INTO transactions
+                   (account_id, transfer_account_id, transaction_type, trade_date, amount,
+                    currency, note, source)
+                 VALUES (?1, ?2, 'TRANSFER', ?3, ?4, ?5, ?6, 'manual')",
+                params![
+                    source_account,
+                    target_account,
+                    trade_date,
+                    amount,
+                    source_currency,
+                    input.note
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            EntryResult {
+                message: "账户转账已记录；内部转移不计入收益和总资产变化".to_string(),
+                realized_gain: None,
+            }
+        }
         "DEPOSIT_OPEN" => {
             let institution = required_text(&input.institution, "存款银行")?;
             let name = required_text(&input.product_name, "存款名称")?;
@@ -909,7 +1161,8 @@ fn apply_entry(conn: &mut Connection, input: &EntryInput) -> Result<EntryResult,
 fn transaction_can_be_reversed(conn: &Connection, transaction_id: i64) -> Result<bool, String> {
     let target: Option<ReversalIdentity> = conn
         .query_row(
-            "SELECT transaction_type, product_id, account_id, deposit_id, reversed_by, source
+            "SELECT transaction_type, product_id, account_id, transfer_account_id,
+                    deposit_id, reversed_by, source
              FROM transactions WHERE id = ?1",
             [transaction_id],
             |row| {
@@ -917,9 +1170,10 @@ fn transaction_can_be_reversed(conn: &Connection, transaction_id: i64) -> Result
                     operation: row.get(0)?,
                     product_id: row.get(1)?,
                     account_id: row.get(2)?,
-                    deposit_id: row.get(3)?,
-                    reversed_by: row.get(4)?,
-                    source: row.get(5)?,
+                    transfer_account_id: row.get(3)?,
+                    deposit_id: row.get(4)?,
+                    reversed_by: row.get(5)?,
+                    source: row.get(6)?,
                 })
             },
         )
@@ -929,6 +1183,7 @@ fn transaction_can_be_reversed(conn: &Connection, transaction_id: i64) -> Result
         operation,
         product_id: product,
         account_id: account,
+        transfer_account_id: transfer_account,
         deposit_id: deposit,
         reversed_by,
         source,
@@ -958,6 +1213,18 @@ fn transaction_can_be_reversed(conn: &Connection, transaction_id: i64) -> Result
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?
+    } else if let Some(account) = account {
+        conn.query_row(
+            "SELECT COUNT(*) FROM transactions
+             WHERE id > ?1 AND source = 'manual' AND reversed_by IS NULL
+               AND transaction_type != 'REVERSAL'
+               AND (account_id = ?2 OR transfer_account_id = ?2)",
+            params![transaction_id, account],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?
+    } else if transfer_account.is_some() {
+        0
     } else {
         1
     };
@@ -1001,7 +1268,7 @@ fn reverse_entry(conn: &mut Connection, transaction_id: i64) -> Result<EntryResu
     let tx = conn.transaction().map_err(|error| error.to_string())?;
     let target: ReversalTarget = tx
         .query_row(
-            "SELECT transaction_type, product_id, account_id, deposit_id, amount,
+            "SELECT transaction_type, product_id, account_id, transfer_account_id, deposit_id, amount,
                     currency, cost_basis, realized_gain, valuation_before, valuation_after
              FROM transactions WHERE id = ?1",
             [transaction_id],
@@ -1010,13 +1277,14 @@ fn reverse_entry(conn: &mut Connection, transaction_id: i64) -> Result<EntryResu
                     operation: row.get(0)?,
                     product_id: row.get(1)?,
                     account_id: row.get(2)?,
-                    deposit_id: row.get(3)?,
-                    amount: row.get(4)?,
-                    currency: row.get(5)?,
-                    cost_basis: row.get(6)?,
-                    realized_gain: row.get(7)?,
-                    valuation_before: row.get(8)?,
-                    valuation_after: row.get(9)?,
+                    transfer_account_id: row.get(3)?,
+                    deposit_id: row.get(4)?,
+                    amount: row.get(5)?,
+                    currency: row.get(6)?,
+                    cost_basis: row.get(7)?,
+                    realized_gain: row.get(8)?,
+                    valuation_before: row.get(9)?,
+                    valuation_after: row.get(10)?,
                 })
             },
         )
@@ -1025,6 +1293,7 @@ fn reverse_entry(conn: &mut Connection, transaction_id: i64) -> Result<EntryResu
         operation,
         product_id: product,
         account_id: account,
+        transfer_account_id: transfer_account,
         deposit_id: deposit,
         amount,
         currency,
@@ -1036,12 +1305,13 @@ fn reverse_entry(conn: &mut Connection, transaction_id: i64) -> Result<EntryResu
     let reversal_date = Local::now().format("%Y-%m-%d").to_string();
     tx.execute(
         "INSERT INTO transactions
-           (product_id, account_id, deposit_id, transaction_type, trade_date, amount, currency,
+           (product_id, account_id, transfer_account_id, deposit_id, transaction_type, trade_date, amount, currency,
             note, cost_basis, realized_gain, valuation_before, valuation_after, reversal_of, source)
-         VALUES (?1, ?2, ?3, 'REVERSAL', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'manual')",
+         VALUES (?1, ?2, ?3, ?4, 'REVERSAL', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'manual')",
         params![
             product,
             account,
+            transfer_account,
             deposit,
             reversal_date,
             amount,
@@ -1097,7 +1367,7 @@ fn reverse_entry(conn: &mut Connection, transaction_id: i64) -> Result<EntryResu
                 .map_err(|error| error.to_string())?;
             }
         }
-        "VALUATION" => {}
+        "VALUATION" | "DIVIDEND" | "FEE" | "TRANSFER" => {}
         "DEPOSIT_OPEN" => {
             tx.execute(
                 "UPDATE deposits SET status = 'cancelled' WHERE id = ?1",
@@ -1143,7 +1413,10 @@ fn clear_excel_data(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM valuations WHERE source = 'excel'", [])?;
     tx.execute("DELETE FROM position_lots WHERE source = 'excel'", [])?;
     tx.execute("DELETE FROM transactions WHERE source = 'excel'", [])?;
-    tx.execute("DELETE FROM deposits WHERE source = 'excel'", [])?;
+    tx.execute(
+        "DELETE FROM deposits WHERE source = 'excel' AND is_user_edited = 0",
+        [],
+    )?;
     tx.execute(
         "UPDATE position_lots
          SET remaining_amount = original_amount, status = 'active'
@@ -1159,14 +1432,14 @@ fn clear_excel_data(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         [],
     )?;
     tx.execute(
-        "DELETE FROM products WHERE source = 'excel'
+        "DELETE FROM products WHERE source = 'excel' AND is_user_edited = 0
          AND id NOT IN (SELECT DISTINCT product_id FROM transactions WHERE product_id IS NOT NULL)
          AND id NOT IN (SELECT DISTINCT product_id FROM position_lots)
          AND id NOT IN (SELECT DISTINCT product_id FROM valuations)",
         [],
     )?;
     tx.execute(
-        "DELETE FROM accounts WHERE source = 'excel'
+        "DELETE FROM accounts WHERE source = 'excel' AND is_user_edited = 0
          AND id NOT IN (SELECT DISTINCT account_id FROM transactions WHERE account_id IS NOT NULL)
          AND id NOT IN (SELECT DISTINCT account_id FROM position_lots)
          AND id NOT IN (SELECT DISTINCT account_id FROM valuations)
@@ -1367,6 +1640,25 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
             warnings.push(format!("Sheet3 第{}行信息不完整，已跳过", index + 1));
             continue;
         }
+        let source_row = (index + 1) as i64;
+        let preserved_edit: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM deposits
+                   WHERE source = 'excel' AND source_row = ?1 AND is_user_edited = 1
+                 )",
+                [source_row],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if preserved_edit {
+            warnings.push(format!(
+                "Sheet3 第{}行已有手工修正，本次导入保留修正后的存款资料",
+                index + 1
+            ));
+            deposits_imported += 1;
+            continue;
+        }
         let account =
             account_id(&tx, &institution, &currency).map_err(|error| error.to_string())?;
         tx.execute(
@@ -1379,7 +1671,7 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
                 principal.unwrap_or_default(),
                 maturity_date.unwrap_or(today).format("%Y-%m-%d").to_string(),
                 annual_rate.unwrap_or_default(),
-                (index + 1) as i64
+                source_row
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -1663,10 +1955,18 @@ fn export_excel(conn: &Connection, target: &Path) -> Result<(), String> {
                         CASE t.transaction_type
                           WHEN 'BUY' THEN '买入' WHEN 'SELL' THEN '卖出'
                           WHEN 'REDEEM' THEN '历史赎回' WHEN 'PRODUCT_MATURITY' THEN '理财到期'
-                          WHEN 'VALUATION' THEN '更新市值' WHEN 'DEPOSIT_OPEN' THEN '定存开户'
+                          WHEN 'VALUATION' THEN '更新市值' WHEN 'DIVIDEND' THEN '分红'
+                          WHEN 'FEE' THEN '费用' WHEN 'TRANSFER' THEN '账户转账'
+                          WHEN 'DEPOSIT_OPEN' THEN '定存开户'
                           WHEN 'DEPOSIT_MATURITY' THEN '定存到期' WHEN 'REVERSAL' THEN '冲销'
                           ELSE t.transaction_type END,
-                        COALESCE(p.name, d.name, '未命名交易'), p.code, a.institution,
+                        CASE WHEN t.transaction_type = 'TRANSFER' THEN
+                          COALESCE(a.institution, '未知账户') || ' → ' || COALESCE(ta.institution, '未知账户')
+                        ELSE COALESCE(p.name, d.name, a.institution, '未命名交易') END,
+                        p.code,
+                        CASE WHEN t.transaction_type = 'TRANSFER' THEN
+                          COALESCE(a.institution, '未知账户') || ' → ' || COALESCE(ta.institution, '未知账户')
+                        ELSE a.institution END,
                         t.currency, t.amount, COALESCE(t.cost_basis, 0),
                         COALESCE(t.realized_gain, 0),
                         CASE t.source WHEN 'manual' THEN '手工' ELSE 'Excel' END,
@@ -1677,6 +1977,7 @@ fn export_excel(conn: &Connection, target: &Path) -> Result<(), String> {
                  LEFT JOIN products p ON p.id = t.product_id
                  LEFT JOIN deposits d ON d.id = t.deposit_id
                  LEFT JOIN accounts a ON a.id = t.account_id
+                 LEFT JOIN accounts ta ON ta.id = t.transfer_account_id
                  ORDER BY t.trade_date, t.id",
             )
             .map_err(|error| error.to_string())?;
@@ -2323,6 +2624,594 @@ fn export_excel(conn: &Connection, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn list_master_data_from_conn(conn: &Connection) -> Result<MasterData, String> {
+    let accounts = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, institution, name, currency, source
+                 FROM accounts ORDER BY currency, institution, name",
+            )
+            .map_err(|error| error.to_string())?;
+        let records = statement
+            .query_map([], |row| {
+                Ok(AccountRecord {
+                    id: row.get(0)?,
+                    institution: row.get(1)?,
+                    name: row.get(2)?,
+                    currency: row.get(3)?,
+                    source: row.get(4)?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        records
+    };
+    let products = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, code, name, currency, issuer, risk_level, source
+                 FROM products ORDER BY currency, name, code",
+            )
+            .map_err(|error| error.to_string())?;
+        let records = statement
+            .query_map([], |row| {
+                Ok(ProductRecord {
+                    id: row.get(0)?,
+                    code: row.get(1)?,
+                    name: row.get(2)?,
+                    currency: row.get(3)?,
+                    issuer: row.get(4)?,
+                    risk_level: row.get(5)?,
+                    source: row.get(6)?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        records
+    };
+    let deposits = {
+        let mut statement = conn
+            .prepare(
+                "SELECT d.id, d.account_id, a.institution, d.name, d.currency, d.principal,
+                        d.start_date, d.maturity_date, d.annual_rate, d.status, d.source
+                 FROM deposits d JOIN accounts a ON a.id = d.account_id
+                 ORDER BY d.status, d.maturity_date, d.id",
+            )
+            .map_err(|error| error.to_string())?;
+        let records = statement
+            .query_map([], |row| {
+                Ok(DepositRecord {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    institution: row.get(2)?,
+                    name: row.get(3)?,
+                    currency: row.get(4)?,
+                    principal: row.get(5)?,
+                    start_date: row.get(6)?,
+                    maturity_date: row.get(7)?,
+                    annual_rate: row.get(8)?,
+                    status: row.get(9)?,
+                    source: row.get(10)?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        records
+    };
+    Ok(MasterData {
+        accounts,
+        products,
+        deposits,
+    })
+}
+
+fn record_master_change(
+    tx: &Transaction<'_>,
+    entity_type: &str,
+    entity_id: i64,
+    before: serde_json::Value,
+    after: serde_json::Value,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO master_data_changes
+           (entity_type, entity_id, changed_at, before_json, after_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            entity_type,
+            entity_id,
+            Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            before.to_string(),
+            after.to_string()
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn apply_master_data_update(
+    conn: &mut Connection,
+    input: &MasterDataUpdate,
+) -> Result<String, String> {
+    let entity = input.entity_type.trim().to_lowercase();
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err("名称不能为空".to_string());
+    }
+    let currency = input.currency.trim().to_uppercase();
+    if !matches!(currency.as_str(), "CNY" | "USD") {
+        return Err("币种必须是 CNY 或 USD".to_string());
+    }
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let message = match entity.as_str() {
+        "account" => {
+            let institution = input.institution.as_deref().unwrap_or_default().trim();
+            if institution.is_empty() {
+                return Err("银行/机构不能为空".to_string());
+            }
+            let before: (String, String, String, String) = tx
+                .query_row(
+                    "SELECT institution, name, currency, source FROM accounts WHERE id = ?1",
+                    [input.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(|_| "没有找到该账户".to_string())?;
+            let linked: i64 = tx
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM transactions WHERE account_id = ?1 OR transfer_account_id = ?1) +
+                       (SELECT COUNT(*) FROM position_lots WHERE account_id = ?1) +
+                       (SELECT COUNT(*) FROM valuations WHERE account_id = ?1) +
+                       (SELECT COUNT(*) FROM deposits WHERE account_id = ?1)",
+                    [input.id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if linked > 0 && before.2 != currency {
+                return Err("已有账本记录的账户不能修改币种".to_string());
+            }
+            tx.execute(
+                "UPDATE accounts
+                 SET institution = ?1, name = ?2, currency = ?3,
+                     import_institution = CASE
+                       WHEN source = 'excel' THEN COALESCE(import_institution, ?4)
+                       ELSE import_institution END,
+                     is_user_edited = 1
+                 WHERE id = ?5",
+                params![institution, name, currency, before.0, input.id],
+            )
+            .map_err(|error| {
+                if error.to_string().contains("UNIQUE") {
+                    "已有同名、同币种账户".to_string()
+                } else {
+                    error.to_string()
+                }
+            })?;
+            record_master_change(
+                &tx,
+                "account",
+                input.id,
+                serde_json::json!({"institution": before.0, "name": before.1, "currency": before.2}),
+                serde_json::json!({"institution": institution, "name": name, "currency": currency}),
+            )?;
+            "账户资料已更新".to_string()
+        }
+        "product" => {
+            let code = input.code.as_deref().unwrap_or_default().trim();
+            if code.is_empty() {
+                return Err("产品代码不能为空".to_string());
+            }
+            let before: (String, String, String, Option<String>, Option<String>) = tx
+                .query_row(
+                    "SELECT code, name, currency, issuer, risk_level FROM products WHERE id = ?1",
+                    [input.id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .map_err(|_| "没有找到该产品".to_string())?;
+            let linked: i64 = tx
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM transactions WHERE product_id = ?1) +
+                       (SELECT COUNT(*) FROM position_lots WHERE product_id = ?1) +
+                       (SELECT COUNT(*) FROM valuations WHERE product_id = ?1)",
+                    [input.id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if linked > 0 && before.2 != currency {
+                return Err("已有账本记录的产品不能修改币种".to_string());
+            }
+            let issuer = input
+                .issuer
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            let risk = input
+                .risk_level
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            tx.execute(
+                "UPDATE products
+                 SET code = ?1, name = ?2, currency = ?3, issuer = ?4, risk_level = ?5,
+                     import_code = CASE WHEN source = 'excel' THEN COALESCE(import_code, ?6)
+                                        ELSE import_code END,
+                     is_user_edited = 1
+                 WHERE id = ?7",
+                params![code, name, currency, issuer, risk, before.0, input.id],
+            )
+            .map_err(|error| {
+                if error.to_string().contains("UNIQUE") {
+                    "产品代码已存在".to_string()
+                } else {
+                    error.to_string()
+                }
+            })?;
+            record_master_change(
+                &tx,
+                "product",
+                input.id,
+                serde_json::json!({"code": before.0, "name": before.1, "currency": before.2, "issuer": before.3, "riskLevel": before.4}),
+                serde_json::json!({"code": code, "name": name, "currency": currency, "issuer": issuer, "riskLevel": risk}),
+            )?;
+            "产品资料已更新".to_string()
+        }
+        "deposit" => {
+            let account_id = input
+                .account_id
+                .ok_or_else(|| "请选择存款账户".to_string())?;
+            let principal = positive_amount(input.principal, "存款本金")?;
+            let maturity =
+                valid_date(input.maturity_date.as_deref().unwrap_or_default(), "到期日")?;
+            let start = input
+                .start_date
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| valid_date(value, "起息日"))
+                .transpose()?;
+            let annual_rate = input.annual_rate.unwrap_or_default();
+            if !(0.0..=1.0).contains(&annual_rate) {
+                return Err("年利率必须在0%到100%之间".to_string());
+            }
+            let account_currency: String = tx
+                .query_row(
+                    "SELECT currency FROM accounts WHERE id = ?1",
+                    [account_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "没有找到存款账户".to_string())?;
+            if account_currency != currency {
+                return Err("存款币种必须与所选账户一致".to_string());
+            }
+            let before: (
+                i64,
+                String,
+                String,
+                f64,
+                Option<String>,
+                String,
+                f64,
+                String,
+            ) = tx
+                .query_row(
+                    "SELECT account_id, name, currency, principal, start_date, maturity_date,
+                            annual_rate, status
+                     FROM deposits WHERE id = ?1",
+                    [input.id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .map_err(|_| "没有找到该存款".to_string())?;
+            if before.7 != "active"
+                && (before.0 != account_id
+                    || before.2 != currency
+                    || (before.3 - principal).abs() > 0.000_001)
+            {
+                return Err("已结清存款只能修改名称、日期和利率备注资料".to_string());
+            }
+            tx.execute(
+                "UPDATE deposits
+                 SET account_id = ?1, name = ?2, currency = ?3, principal = ?4,
+                     start_date = ?5, maturity_date = ?6, annual_rate = ?7,
+                     is_user_edited = 1
+                 WHERE id = ?8",
+                params![
+                    account_id,
+                    name,
+                    currency,
+                    principal,
+                    start,
+                    maturity,
+                    annual_rate,
+                    input.id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE transactions
+                 SET account_id = ?1, amount = ?2, cost_basis = ?2, currency = ?3,
+                     trade_date = COALESCE(?4, trade_date)
+                 WHERE deposit_id = ?5 AND transaction_type = 'DEPOSIT_OPEN'
+                   AND reversed_by IS NULL",
+                params![account_id, principal, currency, start, input.id],
+            )
+            .map_err(|error| error.to_string())?;
+            record_master_change(
+                &tx,
+                "deposit",
+                input.id,
+                serde_json::json!({"accountId": before.0, "name": before.1, "currency": before.2, "principal": before.3, "startDate": before.4, "maturityDate": before.5, "annualRate": before.6}),
+                serde_json::json!({"accountId": account_id, "name": name, "currency": currency, "principal": principal, "startDate": start, "maturityDate": maturity, "annualRate": annual_rate}),
+            )?;
+            "定期存款资料已更新".to_string()
+        }
+        _ => return Err("不支持的资料类型".to_string()),
+    };
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(message)
+}
+
+fn xnpv(rate: f64, cash_flows: &[(NaiveDate, f64)]) -> f64 {
+    let first = cash_flows[0].0;
+    cash_flows
+        .iter()
+        .map(|(date, amount)| {
+            let years = (*date - first).num_days() as f64 / 365.0;
+            amount / (1.0 + rate).powf(years)
+        })
+        .sum()
+}
+
+fn calculate_xirr(cash_flows: &[(NaiveDate, f64)]) -> Option<f64> {
+    if cash_flows.len() < 2
+        || !cash_flows.iter().any(|(_, amount)| *amount < 0.0)
+        || !cash_flows.iter().any(|(_, amount)| *amount > 0.0)
+    {
+        return None;
+    }
+    let mut low = -0.999_999;
+    let mut high = 10.0;
+    let mut low_value = xnpv(low, cash_flows);
+    let mut high_value = xnpv(high, cash_flows);
+    while low_value.signum() == high_value.signum() && high < 1_000_000.0 {
+        high *= 10.0;
+        high_value = xnpv(high, cash_flows);
+    }
+    if !low_value.is_finite()
+        || !high_value.is_finite()
+        || low_value.signum() == high_value.signum()
+    {
+        return None;
+    }
+    for _ in 0..160 {
+        let mid = (low + high) / 2.0;
+        let value = xnpv(mid, cash_flows);
+        if value.abs() < 0.000_001 {
+            return Some(mid);
+        }
+        if value.signum() == low_value.signum() {
+            low = mid;
+            low_value = value;
+        } else {
+            high = mid;
+        }
+    }
+    Some((low + high) / 2.0)
+}
+
+fn transaction_cash_flow(operation: &str, amount: f64) -> Option<f64> {
+    match operation {
+        "BUY" | "DEPOSIT_OPEN" | "FEE" => Some(-amount),
+        "SELL" | "REDEEM" | "PRODUCT_MATURITY" | "DEPOSIT_MATURITY" | "DIVIDEND" => Some(amount),
+        _ => None,
+    }
+}
+
+fn analytics_for_currency(
+    conn: &Connection,
+    currency: &str,
+    today: NaiveDate,
+) -> Result<CurrencyAnalytics, String> {
+    let current_wealth: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(market_value), 0) FROM valuations
+             WHERE is_current = 1 AND currency = ?1",
+            [currency],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let current_deposits: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(principal), 0) FROM deposits
+             WHERE status = 'active' AND currency = ?1",
+            [currency],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let invested_cost: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(COALESCE(l.remaining_amount, l.original_amount)), 0)
+             FROM position_lots l JOIN products p ON p.id = l.product_id
+             WHERE l.status = 'active' AND p.currency = ?1",
+            [currency],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let realized_gain: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(realized_gain), 0) FROM transactions
+             WHERE currency = ?1 AND reversed_by IS NULL AND transaction_type != 'REVERSAL'",
+            [currency],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let income: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM transactions
+             WHERE currency = ?1 AND transaction_type = 'DIVIDEND' AND reversed_by IS NULL",
+            [currency],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let fees: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM transactions
+             WHERE currency = ?1 AND transaction_type = 'FEE' AND reversed_by IS NULL",
+            [currency],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut cash_flows = {
+        let mut statement = conn
+            .prepare(
+                "SELECT trade_date, transaction_type, amount FROM transactions
+                 WHERE currency = ?1 AND reversed_by IS NULL AND transaction_type != 'REVERSAL'
+                 ORDER BY trade_date, id",
+            )
+            .map_err(|error| error.to_string())?;
+        let flows = statement
+            .query_map([currency], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .filter_map(|row| row.ok())
+            .filter_map(|(date, operation, amount)| {
+                Some((
+                    NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?,
+                    transaction_cash_flow(&operation, amount)?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        flows
+    };
+    let terminal_deposits: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(d.principal), 0) FROM deposits d
+             WHERE d.status = 'active' AND d.currency = ?1
+               AND EXISTS (
+                 SELECT 1 FROM transactions t
+                 WHERE t.deposit_id = d.id AND t.transaction_type = 'DEPOSIT_OPEN'
+                   AND t.reversed_by IS NULL
+               )",
+            [currency],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let terminal_value = current_wealth + terminal_deposits;
+    if terminal_value > 0.000_001 {
+        cash_flows.push((today, terminal_value));
+    }
+    cash_flows.sort_by_key(|(date, _)| *date);
+
+    let first_this_month = today.with_day(1).unwrap_or(today);
+    let mut trend = Vec::new();
+    for offset in (0..12).rev() {
+        let month_start = first_this_month
+            .checked_sub_months(Months::new(offset))
+            .unwrap_or(first_this_month);
+        let month_end = month_start
+            .checked_add_months(Months::new(1))
+            .and_then(|date| date.checked_sub_signed(Duration::days(1)))
+            .unwrap_or(today)
+            .min(today);
+        let date = month_end.format("%Y-%m-%d").to_string();
+        let wealth: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(v.market_value), 0) FROM valuations v
+                 WHERE v.currency = ?1 AND v.valuation_date <= ?2
+                   AND v.id = (
+                     SELECT v2.id FROM valuations v2
+                     WHERE v2.product_id = v.product_id AND v2.account_id = v.account_id
+                       AND v2.valuation_date <= ?2
+                     ORDER BY v2.valuation_date DESC, v2.id DESC LIMIT 1
+                   )",
+                params![currency, date],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let deposits: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(principal), 0) FROM deposits
+                 WHERE currency = ?1 AND status != 'cancelled'
+                   AND (start_date IS NULL OR start_date <= ?2)
+                   AND (matured_at IS NULL OR matured_at > ?2)",
+                params![currency, date],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let cumulative_realized_gain: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(realized_gain), 0) FROM transactions
+                 WHERE currency = ?1 AND trade_date <= ?2 AND reversed_by IS NULL
+                   AND transaction_type != 'REVERSAL'",
+                params![currency, date],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let month_prefix = month_start.format("%Y-%m").to_string();
+        let month_flows = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT transaction_type, amount FROM transactions
+                     WHERE currency = ?1 AND substr(trade_date, 1, 7) = ?2
+                       AND reversed_by IS NULL AND transaction_type != 'REVERSAL'",
+                )
+                .map_err(|error| error.to_string())?;
+            let total = statement
+                .query_map(params![currency, month_prefix], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })
+                .map_err(|error| error.to_string())?
+                .filter_map(|row| row.ok())
+                .filter_map(|(operation, amount)| transaction_cash_flow(&operation, amount))
+                .sum();
+            total
+        };
+        trend.push(TrendPoint {
+            date,
+            label: month_start.format("%m月").to_string(),
+            asset_value: wealth + deposits,
+            cumulative_realized_gain,
+            net_cash_flow: month_flows,
+        });
+    }
+    Ok(CurrencyAnalytics {
+        currency: currency.to_string(),
+        xirr: calculate_xirr(&cash_flows),
+        current_value: current_wealth + current_deposits,
+        unrealized_gain: current_wealth - invested_cost,
+        realized_gain,
+        income,
+        fees,
+        trend,
+    })
+}
+
 #[tauri::command]
 fn import_workbook(path: String, state: State<'_, AppState>) -> Result<ImportReport, String> {
     let path = Path::new(&path);
@@ -2394,6 +3283,49 @@ fn export_excel_file(
     Ok(FileOperationResult {
         path,
         message: "Excel 数据包已导出".to_string(),
+    })
+}
+
+#[tauri::command]
+fn list_master_data(state: State<'_, AppState>) -> Result<MasterData, String> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    list_master_data_from_conn(&conn)
+}
+
+#[tauri::command]
+fn update_master_data(
+    input: MasterDataUpdate,
+    state: State<'_, AppState>,
+) -> Result<EntryResult, String> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    create_auto_backup(&conn, &state.backup_dir, "pre-master-edit")?;
+    let message = apply_master_data_update(&mut conn, &input)?;
+    Ok(EntryResult {
+        message,
+        realized_gain: None,
+    })
+}
+
+#[tauri::command]
+fn get_analytics(state: State<'_, AppState>) -> Result<Analytics, String> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    let today = Local::now().date_naive();
+    let currencies = ["CNY", "USD"]
+        .iter()
+        .map(|currency| analytics_for_currency(&conn, currency, today))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Analytics {
+        as_of_date: today.format("%Y-%m-%d").to_string(),
+        currencies,
     })
 }
 
@@ -2568,7 +3500,9 @@ fn list_transactions(state: State<'_, AppState>) -> Result<Vec<TransactionRecord
     let mut statement = conn
         .prepare(
             "SELECT t.id,
-                    COALESCE(p.name, d.name, '未命名交易') AS title,
+                    CASE WHEN t.transaction_type = 'TRANSFER' THEN
+                      COALESCE(a.institution, '未知账户') || ' → ' || COALESCE(ta.institution, '未知账户')
+                    ELSE COALESCE(p.name, d.name, a.institution, '未命名交易') END AS title,
                     p.code,
                     t.transaction_type,
                     t.trade_date,
@@ -2583,6 +3517,8 @@ fn list_transactions(state: State<'_, AppState>) -> Result<Vec<TransactionRecord
              FROM transactions t
              LEFT JOIN products p ON p.id = t.product_id
              LEFT JOIN deposits d ON d.id = t.deposit_id
+             LEFT JOIN accounts a ON a.id = t.account_id
+             LEFT JOIN accounts ta ON ta.id = t.transfer_account_id
              ORDER BY t.trade_date DESC, t.id DESC
              LIMIT 500",
         )
@@ -2625,9 +3561,13 @@ fn get_transaction_detail(
     let can_reverse = transaction_can_be_reversed(&conn, transaction_id)?;
     conn.query_row(
         "SELECT t.id,
-                COALESCE(p.name, d.name, '未命名交易'),
+                CASE WHEN t.transaction_type = 'TRANSFER' THEN
+                  COALESCE(a.institution, '未知账户') || ' → ' || COALESCE(ta.institution, '未知账户')
+                ELSE COALESCE(p.name, d.name, a.institution, '未命名交易') END,
                 p.code,
-                a.institution,
+                CASE WHEN t.transaction_type = 'TRANSFER' THEN
+                  COALESCE(a.institution, '未知账户') || ' → ' || COALESCE(ta.institution, '未知账户')
+                ELSE a.institution END,
                 t.transaction_type,
                 t.trade_date,
                 t.amount,
@@ -2644,6 +3584,7 @@ fn get_transaction_detail(
          LEFT JOIN products p ON p.id = t.product_id
          LEFT JOIN deposits d ON d.id = t.deposit_id
          LEFT JOIN accounts a ON a.id = t.account_id
+         LEFT JOIN accounts ta ON ta.id = t.transfer_account_id
          WHERE t.id = ?1",
         [transaction_id],
         |row| {
@@ -2728,7 +3669,10 @@ pub fn run() {
             reverse_transaction,
             backup_database,
             restore_database,
-            export_excel_file
+            export_excel_file,
+            list_master_data,
+            update_master_data,
+            get_analytics
         ])
         .run(tauri::generate_context!())
         .expect("failed to run wealth manager");
@@ -2829,6 +3773,7 @@ mod tests {
             operation: operation.to_string(),
             product_id: None,
             account_id: None,
+            transfer_account_id: None,
             deposit_id: None,
             product_name: Some("测试理财".to_string()),
             product_code: Some("TEST001".to_string()),
@@ -3129,5 +4074,130 @@ mod tests {
         if preserved_export.is_none() {
             fs::remove_file(export_path).expect("remove test export");
         }
+    }
+
+    #[test]
+    fn dividend_fee_and_transfer_are_auditable_and_reversible() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        apply_entry(&mut conn, &entry("BUY", 10_000.0)).expect("buy");
+        let (product, source_account): (i64, i64) = conn
+            .query_row(
+                "SELECT product_id, account_id FROM position_lots LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("holding ids");
+        let target_account = {
+            let tx = conn.transaction().expect("account transaction");
+            let id = manual_account_id(&tx, "另一家银行", "CNY").expect("target account");
+            tx.commit().expect("commit target account");
+            id
+        };
+
+        let mut dividend = entry("DIVIDEND", 120.0);
+        dividend.product_id = Some(product);
+        dividend.account_id = Some(source_account);
+        apply_entry(&mut conn, &dividend).expect("dividend");
+        let dividend_id: i64 = conn
+            .query_row(
+                "SELECT id FROM transactions WHERE transaction_type = 'DIVIDEND'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("dividend id");
+
+        let mut fee = entry("FEE", 20.0);
+        fee.product_id = Some(product);
+        fee.account_id = Some(source_account);
+        apply_entry(&mut conn, &fee).expect("fee");
+        let fee_id: i64 = conn
+            .query_row(
+                "SELECT id FROM transactions WHERE transaction_type = 'FEE'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fee id");
+        assert!(!transaction_can_be_reversed(&conn, dividend_id).expect("older event"));
+        assert!(transaction_can_be_reversed(&conn, fee_id).expect("latest event"));
+        reverse_entry(&mut conn, fee_id).expect("reverse fee");
+        assert!(transaction_can_be_reversed(&conn, dividend_id).expect("dividend now latest"));
+
+        let mut transfer = entry("TRANSFER", 500.0);
+        transfer.account_id = Some(source_account);
+        transfer.transfer_account_id = Some(target_account);
+        apply_entry(&mut conn, &transfer).expect("transfer");
+        let transfer_id: i64 = conn
+            .query_row(
+                "SELECT id FROM transactions WHERE transaction_type = 'TRANSFER'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("transfer id");
+        assert!(transaction_can_be_reversed(&conn, transfer_id).expect("transfer reversible"));
+        reverse_entry(&mut conn, transfer_id).expect("reverse transfer");
+        let effective_gain: f64 = conn
+            .query_row(
+                "SELECT SUM(realized_gain) FROM transactions
+                 WHERE reversed_by IS NULL AND transaction_type != 'REVERSAL'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("effective gain");
+        assert!((effective_gain - 120.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn edited_imported_master_data_survives_reimport() {
+        let workbook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../理财.xlsx");
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        parse_workbook(&workbook, &mut conn).expect("first import");
+        let product: ProductRecord = {
+            let data = list_master_data_from_conn(&conn).expect("master data");
+            data.products.into_iter().next().expect("product")
+        };
+        apply_master_data_update(
+            &mut conn,
+            &MasterDataUpdate {
+                entity_type: "product".to_string(),
+                id: product.id,
+                name: "手工修正产品名".to_string(),
+                code: Some(product.code.clone()),
+                institution: None,
+                account_id: None,
+                currency: product.currency.clone(),
+                issuer: Some("测试发行方".to_string()),
+                risk_level: Some("R2".to_string()),
+                principal: None,
+                start_date: None,
+                maturity_date: None,
+                annual_rate: None,
+            },
+        )
+        .expect("edit product");
+        parse_workbook(&workbook, &mut conn).expect("second import");
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM products WHERE id = ?1",
+                [product.id],
+                |row| row.get(0),
+            )
+            .expect("preserved product");
+        assert_eq!(name, "手工修正产品名");
+        let audit_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM master_data_changes", [], |row| {
+                row.get(0)
+            })
+            .expect("audit rows");
+        assert_eq!(audit_rows, 1);
+    }
+
+    #[test]
+    fn xirr_matches_a_simple_one_year_return() {
+        let start = NaiveDate::from_ymd_opt(2025, 1, 1).expect("start date");
+        let end = NaiveDate::from_ymd_opt(2026, 1, 1).expect("end date");
+        let result = calculate_xirr(&[(start, -1_000.0), (end, 1_100.0)]).expect("xirr");
+        assert!((result - 0.1).abs() < 0.000_001);
     }
 }

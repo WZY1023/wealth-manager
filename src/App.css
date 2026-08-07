@@ -59,6 +59,7 @@ h1 { font-size: 23px; line-height: 1.2; margin: 0 0 6px; font-weight: 600; }
 .panel { padding: 17px; }
 .panel-header, .month-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 17px; }
 .panel h2, .modal h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.panel-header > div:first-child > span { display: block; margin-top: 4px; color: #728078; font-size: 10px; }
 .segmented { display: flex; background: #eef2ef; border-radius: 8px; padding: 3px; }
 .segmented button { border: 0; border-radius: 6px; background: transparent; padding: 4px 9px; color: #59675f; font-size: 11px; }
 .segmented button.active { background: #fff; color: #17211b; box-shadow: 0 1px 3px rgba(19,44,30,.1); }
@@ -165,11 +166,40 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
 .detail-grid dd { margin: 0; font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .detail-note { grid-column: 1 / -1; }
 .detail-modal > .entry-actions { margin-top: 15px; }
+.analysis-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.analysis-toolbar > span { color: #728078; font-size: 11px; }
+.analysis-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.analysis-metrics .metric-card > strong { font-size: 19px; }
+.analysis-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; margin-bottom: 15px; }
+.trend-chart { position: relative; min-width: 0; }
+.trend-chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.trend-chart text { fill: #7a877f; font-size: 9px; }
+.chart-zero { stroke: #dfe6e0; stroke-width: 1; stroke-dasharray: 4 4; }
+.chart-range { position: absolute; inset: 5px auto 27px 0; display: flex; flex-direction: column-reverse; justify-content: space-between; color: #88938d; font-size: 8px; pointer-events: none; }
+.cash-flow-panel { margin-bottom: 12px; }
+.cash-flow-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 24px; }
+.cash-flow-list > div { display: grid; grid-template-columns: 38px minmax(80px, 1fr) 112px; gap: 9px; align-items: center; padding: 6px 0; font-size: 10px; }
+.cash-flow-list strong { text-align: right; font-weight: 500; font-variant-numeric: tabular-nums; }
+.flow-track { height: 6px; border-radius: 99px; background: #edf1ee; overflow: hidden; }
+.flow-track i { display: block; height: 100%; border-radius: inherit; }
+.flow-track i.positive { background: #56a777; }
+.flow-track i.negative { background: #d17a6d; }
+.analysis-note { margin-top: 0; }
+.master-panel .panel-header { align-items: flex-end; }
+.icon-button { width: 31px; height: 31px; padding: 0; border: 1px solid #d8e1da; border-radius: 8px; background: #fff; color: #3c6951; display: grid; place-items: center; }
+.icon-button:hover { background: #edf5ef; }
+.icon-button svg { width: 14px; height: 14px; }
+.edit-modal { width: min(640px, 100%); }
+.edit-form { margin-top: 19px; }
+.edit-form input:disabled { background: #f1f4f2; color: #66746c; }
 
 @media (max-width: 980px) {
   .metrics-grid { grid-template-columns: 1fr 1fr; }
   .metric-card:last-child { grid-column: 1 / -1; }
   .overview-grid { grid-template-columns: 1fr; }
+  .analysis-metrics { grid-template-columns: 1fr 1fr; }
+  .analysis-metrics .metric-card:last-child { grid-column: auto; }
+  .analysis-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 680px) {
@@ -183,4 +213,9 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
   .data-actions article button { grid-column: 1 / -1; width: 100%; }
   .detail-grid { grid-template-columns: 1fr; }
   .detail-note { grid-column: 1; }
+  .analysis-toolbar { align-items: flex-start; flex-direction: column; }
+  .analysis-metrics { grid-template-columns: 1fr; }
+  .analysis-metrics .metric-card:last-child { grid-column: 1; }
+  .cash-flow-list { grid-template-columns: 1fr; }
+  .master-panel .panel-header { align-items: flex-start; flex-direction: column; }
 }
