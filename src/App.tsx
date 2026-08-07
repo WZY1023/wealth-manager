@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
   BellRing,
@@ -8,10 +8,13 @@ import {
   CheckCircle2,
   ClipboardList,
   Database,
+  Download,
   FileSpreadsheet,
+  HardDriveDownload,
   LayoutDashboard,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
   ShieldCheck,
   WalletCards,
@@ -67,6 +70,16 @@ type TransactionRecord = {
   realizedGain: number;
   currency: CurrencyCode;
   note: string | null;
+  source: string;
+  reversedBy: number | null;
+  reversalOf: number | null;
+  canReverse: boolean;
+};
+
+type TransactionDetail = TransactionRecord & {
+  institution: string | null;
+  valuationBefore: number | null;
+  valuationAfter: number | null;
 };
 
 type EntryInput = {
@@ -87,6 +100,7 @@ type EntryInput = {
 };
 
 type EntryResult = { message: string; realizedGain: number | null };
+type FileOperationResult = { path: string; message: string };
 
 type MaturityEvent = {
   id: number;
@@ -150,6 +164,9 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<ImportReport | null>(null);
   const [entryOpen, setEntryOpen] = useState(false);
+  const [dataOpen, setDataOpen] = useState(false);
+  const [transactionDetail, setTransactionDetail] = useState<TransactionDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -191,6 +208,92 @@ function App() {
       setNotice(
         `已导入 ${nextReport.lotsImported} 笔买入、${nextReport.holdingsImported} 个持仓和 ${nextReport.depositsImported} 笔存款`,
       );
+      await refresh();
+    } catch (reason) {
+      setError(String(reason));
+      setLoading(false);
+    }
+  };
+
+  const exportExcel = async () => {
+    const selected = await save({
+      defaultPath: `稳盈数据-${new Date().toISOString().slice(0, 10)}.xlsx`,
+      filters: [{ name: "Excel 工作簿", extensions: ["xlsx"] }],
+    });
+    if (!selected) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<FileOperationResult>("export_excel_file", { path: selected });
+      setNotice(`${result.message}：${result.path}`);
+      setDataOpen(false);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const backupDatabase = async () => {
+    const selected = await save({
+      defaultPath: `稳盈备份-${new Date().toISOString().slice(0, 10)}.sqlite3`,
+      filters: [{ name: "稳盈数据库备份", extensions: ["sqlite3", "db"] }],
+    });
+    if (!selected) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<FileOperationResult>("backup_database", { path: selected });
+      setNotice(`${result.message}：${result.path}`);
+      setDataOpen(false);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const restoreDatabase = async () => {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "稳盈数据库备份", extensions: ["sqlite3", "db"] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    if (!window.confirm("恢复会用所选备份替换当前数据。程序会先自动保存当前数据库，确定继续吗？")) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<FileOperationResult>("restore_database", { path: selected });
+      setNotice(result.message);
+      setDataOpen(false);
+      await refresh();
+    } catch (reason) {
+      setError(String(reason));
+      setLoading(false);
+    }
+  };
+
+  const openTransaction = async (transactionId: number) => {
+    setDetailLoading(true);
+    setError(null);
+    try {
+      setTransactionDetail(await invoke<TransactionDetail>("get_transaction_detail", { transactionId }));
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const reverseTransaction = async (transactionId: number) => {
+    if (!window.confirm("撤销不会删除原流水，而是生成冲销记录并恢复相关持仓。确定继续吗？")) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<EntryResult>("reverse_transaction", { transactionId });
+      setNotice(result.message);
+      setTransactionDetail(null);
       await refresh();
     } catch (reason) {
       setError(String(reason));
@@ -256,6 +359,7 @@ function App() {
           <div className="header-actions">
             <button className="button secondary" type="button" onClick={() => void refresh()} disabled={loading}><RefreshCw />刷新</button>
             <button className="button secondary" type="button" onClick={() => void importExcel()} disabled={loading}><FileSpreadsheet />导入表格</button>
+            <button className="button secondary" type="button" onClick={() => setDataOpen(true)} disabled={loading}><Database />数据安全</button>
             <button className="button primary" type="button" onClick={() => setEntryOpen(true)}><Plus />记一笔</button>
           </div>
         </header>
@@ -279,7 +383,7 @@ function App() {
               />
             )}
             {view === "holdings" && <HoldingsView holdings={holdings} />}
-            {view === "transactions" && <TransactionsView transactions={transactions} />}
+            {view === "transactions" && <TransactionsView transactions={transactions} onSelect={(id) => void openTransaction(id)} loading={detailLoading} />}
             {view === "calendar" && <CalendarView groups={groupedMaturities} />}
           </>
         )}
@@ -308,6 +412,22 @@ function App() {
           deposits={maturities}
           onClose={() => setEntryOpen(false)}
           onSave={saveEntry}
+        />
+      )}
+      {dataOpen && (
+        <DataSafetyModal
+          busy={loading}
+          onClose={() => setDataOpen(false)}
+          onExport={() => void exportExcel()}
+          onBackup={() => void backupDatabase()}
+          onRestore={() => void restoreDatabase()}
+        />
+      )}
+      {transactionDetail && (
+        <TransactionDetailModal
+          detail={transactionDetail}
+          onClose={() => setTransactionDetail(null)}
+          onReverse={(id) => void reverseTransaction(id)}
         />
       )}
     </div>
@@ -396,22 +516,81 @@ const operationLabels: Record<string, string> = {
   SELL: "卖出",
   REDEEM: "历史赎回",
   PRODUCT_MATURITY: "理财到期",
+  VALUATION: "更新市值",
   DEPOSIT_OPEN: "定存开户",
   DEPOSIT_MATURITY: "定存到期",
+  REVERSAL: "冲销",
 };
 
-function TransactionsView({ transactions }: { transactions: TransactionRecord[] }) {
+function TransactionsView({ transactions, onSelect, loading }: {
+  transactions: TransactionRecord[];
+  onSelect: (id: number) => void;
+  loading: boolean;
+}) {
   return (
     <article className="panel table-panel">
       <div className="panel-header"><h2>交易流水</h2><span>最近{transactions.length}笔 · 买卖成本和已实现收益可追溯</span></div>
       <div className="table-scroll"><table><thead><tr><th>日期</th><th>操作</th><th>产品</th><th>币种</th><th className="number">现金金额</th><th className="number">核销成本</th><th className="number">已实现收益</th><th>备注</th></tr></thead><tbody>
         {transactions.map((item) => {
           const incoming = ["SELL", "REDEEM", "PRODUCT_MATURITY", "DEPOSIT_MATURITY"].includes(item.operation);
-          const hasRealized = incoming && (item.operation !== "REDEEM" || Math.abs(item.realizedGain) > 0.000001);
-          return <tr key={item.id}><td className="nowrap">{item.tradeDate}</td><td><span className={`operation-tag ${incoming ? "incoming" : "outgoing"}`}>{operationLabels[item.operation] ?? item.operation}</span></td><td><strong>{item.title}</strong>{item.code && <span>{item.code}</span>}</td><td>{item.currency}</td><td className={`number ${incoming ? "gain" : ""}`}>{incoming ? "+" : "-"}{formatMoney(item.amount, item.currency)}</td><td className="number">{item.costBasis > 0 ? formatMoney(item.costBasis, item.currency) : "—"}</td><td className={`number ${item.realizedGain >= 0 ? "gain" : "loss"}`}>{hasRealized ? formatMoney(item.realizedGain, item.currency) : "—"}</td><td className="note-cell">{item.note ?? "—"}</td></tr>;
+          const cashless = item.operation === "VALUATION";
+          const reversed = item.reversedBy !== null;
+          const hasRealized = (incoming || item.operation === "REVERSAL") && (item.operation !== "REDEEM" || Math.abs(item.realizedGain) > 0.000001);
+          return <tr className={`transaction-row ${reversed ? "reversed-row" : ""}`} key={item.id} onClick={() => onSelect(item.id)} aria-busy={loading}><td className="nowrap">{item.tradeDate}</td><td><span className={`operation-tag ${item.operation === "REVERSAL" ? "neutral" : incoming ? "incoming" : "outgoing"}`}>{operationLabels[item.operation] ?? item.operation}</span>{reversed && <span className="reversed-label">已冲销</span>}</td><td><strong>{item.title}</strong>{item.code && <span>{item.code}</span>}</td><td>{item.currency}</td><td className={`number ${incoming ? "gain" : ""}`}>{cashless ? "—" : <>{incoming ? "+" : item.operation === "REVERSAL" ? "±" : "-"}{formatMoney(item.amount, item.currency)}</>}</td><td className="number">{Math.abs(item.costBasis) > 0.000001 ? formatMoney(item.costBasis, item.currency) : "—"}</td><td className={`number ${item.realizedGain >= 0 ? "gain" : "loss"}`}>{hasRealized ? formatMoney(item.realizedGain, item.currency) : "—"}</td><td className="note-cell">{item.note ?? "—"}</td></tr>;
         })}
       </tbody></table></div>
     </article>
+  );
+}
+
+function DataSafetyModal({ busy, onClose, onExport, onBackup, onRestore }: {
+  busy: boolean;
+  onClose: () => void;
+  onExport: () => void;
+  onBackup: () => void;
+  onRestore: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal data-modal" role="dialog" aria-modal="true" aria-labelledby="data-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-header"><div><h2 id="data-title">数据安全</h2><p>导出可阅读数据，并为本地数据库建立可恢复快照</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
+        <div className="data-actions">
+          <article><div className="data-action-icon"><Download /></div><div><strong>导出 Excel 数据包</strong><p>包含资产概览、持仓、流水、定存、买入批次和市值历史。</p></div><button className="button secondary" disabled={busy} onClick={onExport}>选择保存位置</button></article>
+          <article><div className="data-action-icon"><HardDriveDownload /></div><div><strong>备份完整数据库</strong><p>保留全部交易关联、冲销记录和历史快照，可用于完整恢复。</p></div><button className="button secondary" disabled={busy} onClick={onBackup}>创建备份</button></article>
+          <article className="restore-action"><div className="data-action-icon"><RotateCcw /></div><div><strong>从备份恢复</strong><p>恢复前会自动备份当前数据库，并检查所选文件完整性。</p></div><button className="button danger-ghost" disabled={busy} onClick={onRestore}>选择备份</button></article>
+        </div>
+        <div className="calculation-note">程序每天首次启动、重新导入 Excel、撤销交易和恢复数据库前，都会自动创建安全快照。</div>
+      </section>
+    </div>
+  );
+}
+
+function TransactionDetailModal({ detail, onClose, onReverse }: {
+  detail: TransactionDetail;
+  onClose: () => void;
+  onReverse: (id: number) => void;
+}) {
+  const status = detail.reversedBy !== null ? `已由交易 #${detail.reversedBy} 冲销` : detail.reversalOf !== null ? `冲销交易 #${detail.reversalOf}` : "有效";
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal detail-modal" role="dialog" aria-modal="true" aria-labelledby="detail-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-header"><div><h2 id="detail-title">交易 #{detail.id}</h2><p>{detail.title}{detail.code ? ` · ${detail.code}` : ""}</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
+        <div className="detail-status"><span className={`operation-tag ${detail.operation === "REVERSAL" ? "neutral" : ""}`}>{operationLabels[detail.operation] ?? detail.operation}</span><span>{status}</span><span>{detail.source === "manual" ? "手工录入" : "Excel 导入"}</span></div>
+        <dl className="detail-grid">
+          <div><dt>操作日期</dt><dd>{detail.tradeDate}</dd></div>
+          <div><dt>银行/渠道</dt><dd>{detail.institution ?? "—"}</dd></div>
+          <div><dt>现金金额</dt><dd>{detail.operation === "VALUATION" ? "—" : formatMoney(detail.amount, detail.currency)}</dd></div>
+          <div><dt>核销成本</dt><dd>{Math.abs(detail.costBasis) > 0.000001 ? formatMoney(detail.costBasis, detail.currency) : "—"}</dd></div>
+          <div><dt>已实现收益</dt><dd>{Math.abs(detail.realizedGain) > 0.000001 ? formatMoney(detail.realizedGain, detail.currency) : "—"}</dd></div>
+          <div><dt>币种</dt><dd>{detail.currency}</dd></div>
+          {detail.valuationBefore !== null && <div><dt>操作前市值</dt><dd>{formatMoney(detail.valuationBefore, detail.currency)}</dd></div>}
+          {detail.valuationAfter !== null && <div><dt>操作后市值</dt><dd>{formatMoney(detail.valuationAfter, detail.currency)}</dd></div>}
+          <div className="detail-note"><dt>备注</dt><dd>{detail.note ?? "—"}</dd></div>
+        </dl>
+        {!detail.canReverse && detail.source === "manual" && detail.operation !== "REVERSAL" && detail.reversedBy === null && <div className="calculation-note">该产品或存款存在更新的操作。需要从最新一笔开始依次撤销，才能保证批次成本和市值连续。</div>}
+        <div className="entry-actions"><button className="button secondary" onClick={onClose}>关闭</button>{detail.canReverse && <button className="button danger" onClick={() => onReverse(detail.id)}><RotateCcw />安全撤销</button>}</div>
+      </section>
+    </div>
   );
 }
 

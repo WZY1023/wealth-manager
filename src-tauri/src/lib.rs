@@ -1,12 +1,20 @@
 use calamine::{open_workbook_auto, Data, DataType, Reader};
 use chrono::{Duration, Local, NaiveDate};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction, MAIN_DB};
+use rust_xlsxwriter::{
+    Color, ExcelDateTime, Format, FormatAlign, FormatBorder, Formula, Workbook, Worksheet,
+};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path, sync::Mutex};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 use tauri::{Manager, State};
 
 struct AppState {
     db: Mutex<Connection>,
+    backup_dir: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,6 +95,61 @@ struct TransactionRecord {
     realized_gain: f64,
     currency: String,
     note: Option<String>,
+    source: String,
+    reversed_by: Option<i64>,
+    reversal_of: Option<i64>,
+    can_reverse: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransactionDetail {
+    id: i64,
+    title: String,
+    code: Option<String>,
+    institution: Option<String>,
+    operation: String,
+    trade_date: String,
+    amount: f64,
+    cost_basis: f64,
+    realized_gain: f64,
+    currency: String,
+    note: Option<String>,
+    source: String,
+    valuation_before: Option<f64>,
+    valuation_after: Option<f64>,
+    reversed_by: Option<i64>,
+    reversal_of: Option<i64>,
+    can_reverse: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileOperationResult {
+    path: String,
+    message: String,
+}
+
+struct ReversalIdentity {
+    operation: String,
+    product_id: Option<i64>,
+    account_id: Option<i64>,
+    deposit_id: Option<i64>,
+    reversed_by: Option<i64>,
+    source: String,
+}
+
+struct ReversalTarget {
+    operation: String,
+    product_id: Option<i64>,
+    account_id: Option<i64>,
+    deposit_id: Option<i64>,
+    amount: f64,
+    currency: String,
+    cost_basis: f64,
+    realized_gain: f64,
+    valuation_before: Option<f64>,
+    valuation_after: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,11 +216,17 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           cost_basis REAL NOT NULL DEFAULT 0,
           realized_gain REAL NOT NULL DEFAULT 0,
           deposit_id INTEGER,
+          valuation_before REAL,
+          valuation_after REAL,
+          reversal_of INTEGER,
+          reversed_by INTEGER,
           source TEXT NOT NULL DEFAULT 'manual',
           source_row INTEGER,
           FOREIGN KEY(product_id) REFERENCES products(id),
           FOREIGN KEY(account_id) REFERENCES accounts(id),
-          FOREIGN KEY(deposit_id) REFERENCES deposits(id)
+          FOREIGN KEY(deposit_id) REFERENCES deposits(id),
+          FOREIGN KEY(reversal_of) REFERENCES transactions(id),
+          FOREIGN KEY(reversed_by) REFERENCES transactions(id)
         );
 
         CREATE TABLE IF NOT EXISTS position_lots (
@@ -169,10 +238,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           remaining_amount REAL NOT NULL,
           end_date TEXT,
           status TEXT NOT NULL,
+          transaction_id INTEGER,
           source TEXT NOT NULL DEFAULT 'manual',
           source_row INTEGER,
           FOREIGN KEY(product_id) REFERENCES products(id),
-          FOREIGN KEY(account_id) REFERENCES accounts(id)
+          FOREIGN KEY(account_id) REFERENCES accounts(id),
+          FOREIGN KEY(transaction_id) REFERENCES transactions(id)
         );
 
         CREATE TABLE IF NOT EXISTS valuations (
@@ -183,10 +254,22 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           market_value REAL NOT NULL,
           currency TEXT NOT NULL,
           is_current INTEGER NOT NULL DEFAULT 1,
+          transaction_id INTEGER,
           source TEXT NOT NULL DEFAULT 'manual',
           source_row INTEGER,
           FOREIGN KEY(product_id) REFERENCES products(id),
-          FOREIGN KEY(account_id) REFERENCES accounts(id)
+          FOREIGN KEY(account_id) REFERENCES accounts(id),
+          FOREIGN KEY(transaction_id) REFERENCES transactions(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS transaction_lot_allocations (
+          id INTEGER PRIMARY KEY,
+          transaction_id INTEGER NOT NULL,
+          lot_id INTEGER NOT NULL,
+          allocated_cost REAL NOT NULL,
+          FOREIGN KEY(transaction_id) REFERENCES transactions(id) ON DELETE CASCADE,
+          FOREIGN KEY(lot_id) REFERENCES position_lots(id) ON DELETE CASCADE,
+          UNIQUE(transaction_id, lot_id)
         );
 
         CREATE TABLE IF NOT EXISTS deposits (
@@ -230,7 +313,13 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "REAL NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "transactions", "deposit_id", "INTEGER")?;
+    ensure_column(conn, "transactions", "valuation_before", "REAL")?;
+    ensure_column(conn, "transactions", "valuation_after", "REAL")?;
+    ensure_column(conn, "transactions", "reversal_of", "INTEGER")?;
+    ensure_column(conn, "transactions", "reversed_by", "INTEGER")?;
     ensure_column(conn, "position_lots", "remaining_amount", "REAL")?;
+    ensure_column(conn, "position_lots", "transaction_id", "INTEGER")?;
+    ensure_column(conn, "valuations", "transaction_id", "INTEGER")?;
     ensure_column(conn, "deposits", "status", "TEXT NOT NULL DEFAULT 'active'")?;
     ensure_column(conn, "deposits", "matured_at", "TEXT")?;
     ensure_column(conn, "deposits", "proceeds", "REAL")?;
@@ -413,15 +502,16 @@ fn replace_current_valuation(
     date: &str,
     value: f64,
     currency: &str,
+    transaction_id: Option<i64>,
 ) -> rusqlite::Result<()> {
     tx.execute(
         "UPDATE valuations SET is_current = 0 WHERE product_id = ?1 AND account_id = ?2 AND is_current = 1",
         params![product, account],
     )?;
     tx.execute(
-        "INSERT INTO valuations (product_id, account_id, valuation_date, market_value, currency, is_current, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, 1, 'manual')",
-        params![product, account, date, value.max(0.0), currency],
+        "INSERT INTO valuations (product_id, account_id, valuation_date, market_value, currency, is_current, transaction_id, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, 'manual')",
+        params![product, account, date, value.max(0.0), currency, transaction_id],
     )?;
     Ok(())
 }
@@ -459,7 +549,7 @@ fn consume_fifo_cost(
     account: i64,
     through_date: &str,
     mut cost_to_remove: f64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Vec<(i64, f64)>> {
     let lots = {
         let mut statement = tx.prepare(
             "SELECT id, COALESCE(remaining_amount, original_amount)
@@ -475,6 +565,7 @@ fn consume_fifo_cost(
             .collect::<Result<Vec<_>, _>>()?;
         rows
     };
+    let mut allocations = Vec::new();
     for (lot_id, remaining) in lots {
         if cost_to_remove <= 0.000_001 {
             break;
@@ -493,7 +584,27 @@ fn consume_fifo_cost(
                 lot_id
             ],
         )?;
+        allocations.push((lot_id, consumed));
         cost_to_remove -= consumed;
+    }
+    Ok(allocations)
+}
+
+fn save_allocations(
+    tx: &Transaction<'_>,
+    transaction_id: i64,
+    allocations: &[(i64, f64)],
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM transaction_lot_allocations WHERE transaction_id = ?1",
+        [transaction_id],
+    )?;
+    for (lot_id, allocated_cost) in allocations {
+        tx.execute(
+            "INSERT INTO transaction_lot_allocations (transaction_id, lot_id, allocated_cost)
+             VALUES (?1, ?2, ?3)",
+            params![transaction_id, lot_id, allocated_cost],
+        )?;
     }
     Ok(())
 }
@@ -505,29 +616,40 @@ fn replay_manual_exits(tx: &Transaction<'_>) -> rusqlite::Result<()> {
          WHERE source = 'manual'",
         [],
     )?;
+    tx.execute(
+        "UPDATE position_lots
+         SET remaining_amount = 0, status = 'reversed'
+         WHERE transaction_id IN (
+           SELECT id FROM transactions WHERE reversed_by IS NOT NULL
+         )",
+        [],
+    )?;
     let exits = {
         let mut statement = tx.prepare(
-            "SELECT product_id, account_id, trade_date, cost_basis
+            "SELECT id, product_id, account_id, trade_date, cost_basis
              FROM transactions
              WHERE source = 'manual'
                AND transaction_type IN ('SELL', 'PRODUCT_MATURITY')
+               AND reversed_by IS NULL
                AND product_id IS NOT NULL AND account_id IS NOT NULL
              ORDER BY trade_date, id",
         )?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, f64>(3)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, i64>(0)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows
     };
-    for (product, account, date, cost_basis) in exits {
-        consume_fifo_cost(tx, product, account, &date, cost_basis)?;
+    for (product, account, date, cost_basis, transaction_id) in exits {
+        let allocations = consume_fifo_cost(tx, product, account, &date, cost_basis)?;
+        save_allocations(tx, transaction_id, &allocations)?;
     }
     Ok(())
 }
@@ -559,28 +681,44 @@ fn apply_entry(conn: &mut Connection, input: &EntryInput) -> Result<EntryResult,
             };
             let account = manual_account_id(&tx, &institution, &currency)
                 .map_err(|error| error.to_string())?;
-            tx.execute(
-                "INSERT INTO transactions (product_id, account_id, transaction_type, trade_date, amount, currency, note, cost_basis, source)
-                 VALUES (?1, ?2, 'BUY', ?3, ?4, ?5, ?6, ?4, 'manual')",
-                params![product, account, trade_date, amount, currency, input.note],
-            )
-            .map_err(|error| error.to_string())?;
-            tx.execute(
-                "INSERT INTO position_lots (product_id, account_id, purchase_date, original_amount, remaining_amount, status, source)
-                 VALUES (?1, ?2, ?3, ?4, ?4, 'active', 'manual')",
-                params![product, account, trade_date, amount],
-            )
-            .map_err(|error| error.to_string())?;
             let previous = current_market_value(&tx, product, account)
                 .map_err(|error| error.to_string())?
                 .unwrap_or_default();
+            let next_market = previous + amount;
+            tx.execute(
+                "INSERT INTO transactions
+                   (product_id, account_id, transaction_type, trade_date, amount, currency, note,
+                    cost_basis, valuation_before, valuation_after, source)
+                 VALUES (?1, ?2, 'BUY', ?3, ?4, ?5, ?6, ?4, ?7, ?8, 'manual')",
+                params![
+                    product,
+                    account,
+                    trade_date,
+                    amount,
+                    currency,
+                    input.note,
+                    previous,
+                    next_market
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            let transaction_id = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO position_lots
+                   (product_id, account_id, purchase_date, original_amount, remaining_amount,
+                    status, transaction_id, source)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 'active', ?5, 'manual')",
+                params![product, account, trade_date, amount, transaction_id],
+            )
+            .map_err(|error| error.to_string())?;
             replace_current_valuation(
                 &tx,
                 product,
                 account,
                 &trade_date,
-                previous + amount,
+                next_market,
                 &currency,
+                Some(transaction_id),
             )
             .map_err(|error| error.to_string())?;
             EntryResult {
@@ -610,30 +748,49 @@ fn apply_entry(conn: &mut Connection, input: &EntryInput) -> Result<EntryResult,
                 return Err("部分卖出的到账金额不能超过当前市值".to_string());
             }
             let cost_basis = if full { cost } else { cost * proceeds / market };
-            consume_fifo_cost(&tx, product, account, &trade_date, cost_basis)
-                .map_err(|error| error.to_string())?;
             let realized_gain = proceeds - cost_basis;
             let next_market = if full {
                 0.0
             } else {
                 (market - proceeds).max(0.0)
             };
-            replace_current_valuation(&tx, product, account, &trade_date, next_market, &currency)
-                .map_err(|error| error.to_string())?;
             tx.execute(
-                "INSERT INTO transactions (product_id, account_id, transaction_type, trade_date, amount, currency, note, cost_basis, realized_gain, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'manual')",
+                "INSERT INTO transactions
+                   (product_id, account_id, transaction_type, trade_date, amount, currency, note,
+                    cost_basis, realized_gain, valuation_before, valuation_after, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'manual')",
                 params![
                     product,
                     account,
-                    if operation == "PRODUCT_MATURITY" { "PRODUCT_MATURITY" } else { "SELL" },
+                    if operation == "PRODUCT_MATURITY" {
+                        "PRODUCT_MATURITY"
+                    } else {
+                        "SELL"
+                    },
                     trade_date,
                     proceeds,
                     currency,
                     input.note,
                     cost_basis,
-                    realized_gain
+                    realized_gain,
+                    market,
+                    next_market
                 ],
+            )
+            .map_err(|error| error.to_string())?;
+            let transaction_id = tx.last_insert_rowid();
+            let allocations = consume_fifo_cost(&tx, product, account, &trade_date, cost_basis)
+                .map_err(|error| error.to_string())?;
+            save_allocations(&tx, transaction_id, &allocations)
+                .map_err(|error| error.to_string())?;
+            replace_current_valuation(
+                &tx,
+                product,
+                account,
+                &trade_date,
+                next_market,
+                &currency,
+                Some(transaction_id),
             )
             .map_err(|error| error.to_string())?;
             EntryResult {
@@ -654,8 +811,28 @@ fn apply_entry(conn: &mut Connection, input: &EntryInput) -> Result<EntryResult,
                 .account_id
                 .ok_or_else(|| "请选择购买渠道".to_string())?;
             let currency = holding_currency(&tx, product, account)?;
-            replace_current_valuation(&tx, product, account, &trade_date, value, &currency)
-                .map_err(|error| error.to_string())?;
+            let previous = current_market_value(&tx, product, account)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "没有找到该产品的当前市值".to_string())?;
+            tx.execute(
+                "INSERT INTO transactions
+                   (product_id, account_id, transaction_type, trade_date, amount, currency, note,
+                    valuation_before, valuation_after, source)
+                 VALUES (?1, ?2, 'VALUATION', ?3, ?4, ?5, ?6, ?7, ?4, 'manual')",
+                params![product, account, trade_date, value, currency, input.note, previous],
+            )
+            .map_err(|error| error.to_string())?;
+            let transaction_id = tx.last_insert_rowid();
+            replace_current_valuation(
+                &tx,
+                product,
+                account,
+                &trade_date,
+                value,
+                &currency,
+                Some(transaction_id),
+            )
+            .map_err(|error| error.to_string())?;
             EntryResult {
                 message: "当前市值已更新，旧市值已作为历史快照保留".to_string(),
                 realized_gain: None,
@@ -729,6 +906,239 @@ fn apply_entry(conn: &mut Connection, input: &EntryInput) -> Result<EntryResult,
     Ok(result)
 }
 
+fn transaction_can_be_reversed(conn: &Connection, transaction_id: i64) -> Result<bool, String> {
+    let target: Option<ReversalIdentity> = conn
+        .query_row(
+            "SELECT transaction_type, product_id, account_id, deposit_id, reversed_by, source
+             FROM transactions WHERE id = ?1",
+            [transaction_id],
+            |row| {
+                Ok(ReversalIdentity {
+                    operation: row.get(0)?,
+                    product_id: row.get(1)?,
+                    account_id: row.get(2)?,
+                    deposit_id: row.get(3)?,
+                    reversed_by: row.get(4)?,
+                    source: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(ReversalIdentity {
+        operation,
+        product_id: product,
+        account_id: account,
+        deposit_id: deposit,
+        reversed_by,
+        source,
+    }) = target
+    else {
+        return Ok(false);
+    };
+    if source != "manual" || operation == "REVERSAL" || reversed_by.is_some() {
+        return Ok(false);
+    }
+    let later: i64 = if let (Some(product), Some(account)) = (product, account) {
+        conn.query_row(
+            "SELECT COUNT(*) FROM transactions
+             WHERE id > ?1 AND source = 'manual' AND reversed_by IS NULL
+               AND transaction_type != 'REVERSAL'
+               AND product_id = ?2 AND account_id = ?3",
+            params![transaction_id, product, account],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?
+    } else if let Some(deposit) = deposit {
+        conn.query_row(
+            "SELECT COUNT(*) FROM transactions
+             WHERE id > ?1 AND source = 'manual' AND reversed_by IS NULL
+               AND transaction_type != 'REVERSAL' AND deposit_id = ?2",
+            params![transaction_id, deposit],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        1
+    };
+    if later > 0 {
+        return Ok(false);
+    }
+    if matches!(
+        operation.as_str(),
+        "BUY" | "SELL" | "PRODUCT_MATURITY" | "VALUATION"
+    ) {
+        let has_snapshot: bool = conn
+            .query_row(
+                "SELECT valuation_before IS NOT NULL FROM transactions WHERE id = ?1",
+                [transaction_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_snapshot {
+            return Ok(false);
+        }
+    }
+    if matches!(operation.as_str(), "SELL" | "PRODUCT_MATURITY") {
+        let allocations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transaction_lot_allocations WHERE transaction_id = ?1",
+                [transaction_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if allocations == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn reverse_entry(conn: &mut Connection, transaction_id: i64) -> Result<EntryResult, String> {
+    if !transaction_can_be_reversed(conn, transaction_id)? {
+        return Err("只能撤销该产品或存款最新的一笔可逆手工操作；请先撤销后续操作".to_string());
+    }
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let target: ReversalTarget = tx
+        .query_row(
+            "SELECT transaction_type, product_id, account_id, deposit_id, amount,
+                    currency, cost_basis, realized_gain, valuation_before, valuation_after
+             FROM transactions WHERE id = ?1",
+            [transaction_id],
+            |row| {
+                Ok(ReversalTarget {
+                    operation: row.get(0)?,
+                    product_id: row.get(1)?,
+                    account_id: row.get(2)?,
+                    deposit_id: row.get(3)?,
+                    amount: row.get(4)?,
+                    currency: row.get(5)?,
+                    cost_basis: row.get(6)?,
+                    realized_gain: row.get(7)?,
+                    valuation_before: row.get(8)?,
+                    valuation_after: row.get(9)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let ReversalTarget {
+        operation,
+        product_id: product,
+        account_id: account,
+        deposit_id: deposit,
+        amount,
+        currency,
+        cost_basis,
+        realized_gain,
+        valuation_before: before,
+        valuation_after: after,
+    } = target;
+    let reversal_date = Local::now().format("%Y-%m-%d").to_string();
+    tx.execute(
+        "INSERT INTO transactions
+           (product_id, account_id, deposit_id, transaction_type, trade_date, amount, currency,
+            note, cost_basis, realized_gain, valuation_before, valuation_after, reversal_of, source)
+         VALUES (?1, ?2, ?3, 'REVERSAL', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'manual')",
+        params![
+            product,
+            account,
+            deposit,
+            reversal_date,
+            amount,
+            currency,
+            format!("冲销交易 #{transaction_id}（{operation}）"),
+            -cost_basis,
+            -realized_gain,
+            after,
+            before,
+            transaction_id
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    let reversal_id = tx.last_insert_rowid();
+
+    match operation.as_str() {
+        "BUY" => {
+            let changed = tx
+                .execute(
+                    "UPDATE position_lots SET remaining_amount = 0, status = 'reversed'
+                     WHERE transaction_id = ?1",
+                    [transaction_id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Err("该买入缺少批次关联，无法安全撤销".to_string());
+            }
+        }
+        "SELL" | "PRODUCT_MATURITY" => {
+            let allocations = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT lot_id, allocated_cost FROM transaction_lot_allocations
+                         WHERE transaction_id = ?1",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([transaction_id], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+                    })
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                rows
+            };
+            for (lot_id, allocated_cost) in allocations {
+                tx.execute(
+                    "UPDATE position_lots
+                     SET remaining_amount = MIN(original_amount, remaining_amount + ?1), status = 'active'
+                     WHERE id = ?2",
+                    params![allocated_cost, lot_id],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        "VALUATION" => {}
+        "DEPOSIT_OPEN" => {
+            tx.execute(
+                "UPDATE deposits SET status = 'cancelled' WHERE id = ?1",
+                [deposit.ok_or_else(|| "缺少存款关联".to_string())?],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        "DEPOSIT_MATURITY" => {
+            tx.execute(
+                "UPDATE deposits SET status = 'active', matured_at = NULL, proceeds = NULL WHERE id = ?1",
+                [deposit.ok_or_else(|| "缺少存款关联".to_string())?],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        _ => return Err("该交易类型不支持撤销".to_string()),
+    }
+
+    if let (Some(product), Some(account), Some(previous)) = (product, account, before) {
+        replace_current_valuation(
+            &tx,
+            product,
+            account,
+            &reversal_date,
+            previous,
+            &currency,
+            Some(reversal_id),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    tx.execute(
+        "UPDATE transactions SET reversed_by = ?1 WHERE id = ?2",
+        params![reversal_id, transaction_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(EntryResult {
+        message: format!("交易 #{transaction_id} 已安全冲销，相关持仓和收益已恢复"),
+        realized_gain: None,
+    })
+}
+
 fn clear_excel_data(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM valuations WHERE source = 'excel'", [])?;
     tx.execute("DELETE FROM position_lots WHERE source = 'excel'", [])?;
@@ -738,6 +1148,14 @@ fn clear_excel_data(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         "UPDATE position_lots
          SET remaining_amount = original_amount, status = 'active'
          WHERE source = 'manual'",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE position_lots
+         SET remaining_amount = 0, status = 'reversed'
+         WHERE transaction_id IN (
+           SELECT id FROM transactions WHERE reversed_by IS NOT NULL
+         )",
         [],
     )?;
     tx.execute(
@@ -994,6 +1412,917 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
     })
 }
 
+fn backup_to_path(conn: &Connection, target: &Path) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| "备份路径不正确".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "sqlite3" | "db") {
+        return Err("备份文件必须使用 .sqlite3 或 .db 扩展名".to_string());
+    }
+    let temp_name = format!(
+        ".{}.{}.tmp.sqlite3",
+        target
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("wealth-manager"),
+        Local::now().format("%Y%m%d%H%M%S%3f")
+    );
+    let temp_path = parent.join(temp_name);
+    conn.backup(MAIN_DB, &temp_path, None)
+        .map_err(|error| error.to_string())?;
+    if target.exists() {
+        fs::remove_file(target).map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temp_path, target).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn create_auto_backup(
+    conn: &Connection,
+    backup_dir: &Path,
+    reason: &str,
+) -> Result<PathBuf, String> {
+    let path = backup_dir.join(format!(
+        "auto-{}-{reason}.sqlite3",
+        Local::now().format("%Y%m%d-%H%M%S-%3f")
+    ));
+    backup_to_path(conn, &path)?;
+    Ok(path)
+}
+
+fn ensure_daily_backup(conn: &Connection, backup_dir: &Path) -> Result<(), String> {
+    let prefix = format!("auto-{}-", Local::now().format("%Y%m%d"));
+    let exists = fs::read_dir(backup_dir)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
+    if !exists {
+        create_auto_backup(conn, backup_dir, "startup")?;
+    }
+    Ok(())
+}
+
+fn validate_backup(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("所选备份文件不存在".to_string());
+    }
+    let source = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "无法读取所选备份".to_string())?;
+    let integrity: String = source
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if integrity != "ok" {
+        return Err(format!("备份完整性检查失败：{integrity}"));
+    }
+    let required_tables: i64 = source
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('accounts', 'products', 'transactions',
+                                                'position_lots', 'valuations', 'deposits')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if required_tables != 6 {
+        return Err("所选文件不是有效的稳盈数据库备份".to_string());
+    }
+    Ok(())
+}
+
+fn export_formats() -> (Format, Format, Format, Format, Format, Format, Format) {
+    let title = Format::new()
+        .set_bold()
+        .set_font_size(18)
+        .set_font_color(Color::White)
+        .set_background_color(Color::RGB(0x173B2A))
+        .set_align(FormatAlign::VerticalCenter);
+    let subtitle = Format::new()
+        .set_font_color(Color::RGB(0x66746C))
+        .set_italic();
+    let header = Format::new()
+        .set_bold()
+        .set_font_color(Color::White)
+        .set_background_color(Color::RGB(0x2E7D55))
+        .set_border_bottom(FormatBorder::Thin)
+        .set_align(FormatAlign::VerticalCenter);
+    let money = Format::new()
+        .set_num_format("#,##0.00;[Red](#,##0.00);-")
+        .set_align(FormatAlign::Right);
+    let percent = Format::new()
+        .set_num_format("0.00%;[Red](0.00%);-")
+        .set_align(FormatAlign::Right);
+    let date = Format::new().set_num_format("yyyy-mm-dd");
+    let linked_formula = Format::new()
+        .set_num_format("#,##0.00;[Red](#,##0.00);-")
+        .set_font_color(Color::RGB(0x008000))
+        .set_align(FormatAlign::Right);
+    (
+        title,
+        subtitle,
+        header,
+        money,
+        percent,
+        date,
+        linked_formula,
+    )
+}
+
+struct ExportHeadingFormats<'a> {
+    title: &'a Format,
+    subtitle: &'a Format,
+    header: &'a Format,
+}
+
+fn write_export_heading(
+    sheet: &mut Worksheet,
+    title_text: &str,
+    subtitle_text: &str,
+    last_col: u16,
+    formats: &ExportHeadingFormats<'_>,
+    headers: &[&str],
+) -> Result<(), String> {
+    sheet
+        .merge_range(0, 0, 0, last_col, title_text, formats.title)
+        .map_err(|error| error.to_string())?;
+    sheet
+        .set_row_height(0, 28)
+        .map_err(|error| error.to_string())?;
+    sheet
+        .merge_range(1, 0, 1, last_col, subtitle_text, formats.subtitle)
+        .map_err(|error| error.to_string())?;
+    for (column, value) in headers.iter().enumerate() {
+        sheet
+            .write_string_with_format(2, column as u16, *value, formats.header)
+            .map_err(|error| error.to_string())?;
+    }
+    sheet
+        .set_freeze_panes(3, 0)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn write_export_date(
+    sheet: &mut Worksheet,
+    row: u32,
+    column: u16,
+    value: &str,
+    format: &Format,
+) -> Result<(), String> {
+    match ExcelDateTime::parse_from_str(value) {
+        Ok(date) => sheet
+            .write_datetime_with_format(row, column, &date, format)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Err(_) => sheet
+            .write_string(row, column, value)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn export_excel(conn: &Connection, target: &Path) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| "导出路径不正确".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if !extension.eq_ignore_ascii_case("xlsx") {
+        return Err("导出文件必须使用 .xlsx 扩展名".to_string());
+    }
+
+    type HoldingRow = (String, String, String, String, f64, f64, f64, f64, String);
+    let holdings: Vec<HoldingRow> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT p.name, p.code, v.currency, a.institution,
+                        COALESCE(SUM(COALESCE(l.remaining_amount, l.original_amount)), 0),
+                        v.market_value,
+                        v.market_value - COALESCE(SUM(COALESCE(l.remaining_amount, l.original_amount)), 0),
+                        CASE WHEN COALESCE(SUM(COALESCE(l.remaining_amount, l.original_amount)), 0) = 0
+                             THEN 0 ELSE (v.market_value / SUM(COALESCE(l.remaining_amount, l.original_amount))) - 1 END,
+                        v.valuation_date
+                 FROM valuations v
+                 JOIN products p ON p.id = v.product_id
+                 JOIN accounts a ON a.id = v.account_id
+                 LEFT JOIN position_lots l ON l.product_id = v.product_id
+                     AND l.account_id = v.account_id AND l.status = 'active'
+                 WHERE v.is_current = 1 AND (v.market_value > 0.000001 OR l.id IS NOT NULL)
+                 GROUP BY v.id, p.name, p.code, v.currency, a.institution, v.market_value, v.valuation_date
+                 ORDER BY v.currency, v.market_value DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    type TransactionRow = (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        f64,
+        f64,
+        f64,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let transactions: Vec<TransactionRow> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT t.id, t.trade_date,
+                        CASE t.transaction_type
+                          WHEN 'BUY' THEN '买入' WHEN 'SELL' THEN '卖出'
+                          WHEN 'REDEEM' THEN '历史赎回' WHEN 'PRODUCT_MATURITY' THEN '理财到期'
+                          WHEN 'VALUATION' THEN '更新市值' WHEN 'DEPOSIT_OPEN' THEN '定存开户'
+                          WHEN 'DEPOSIT_MATURITY' THEN '定存到期' WHEN 'REVERSAL' THEN '冲销'
+                          ELSE t.transaction_type END,
+                        COALESCE(p.name, d.name, '未命名交易'), p.code, a.institution,
+                        t.currency, t.amount, COALESCE(t.cost_basis, 0),
+                        COALESCE(t.realized_gain, 0),
+                        CASE t.source WHEN 'manual' THEN '手工' ELSE 'Excel' END,
+                        CASE WHEN t.reversed_by IS NOT NULL THEN '已冲销'
+                             WHEN t.reversal_of IS NOT NULL THEN '冲销记录' ELSE '有效' END,
+                        t.note, t.reversal_of, t.reversed_by
+                 FROM transactions t
+                 LEFT JOIN products p ON p.id = t.product_id
+                 LEFT JOIN deposits d ON d.id = t.deposit_id
+                 LEFT JOIN accounts a ON a.id = t.account_id
+                 ORDER BY t.trade_date, t.id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    type DepositRow = (
+        String,
+        String,
+        String,
+        f64,
+        Option<String>,
+        String,
+        f64,
+        String,
+        Option<String>,
+        Option<f64>,
+    );
+    let deposits: Vec<DepositRow> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT d.name, a.institution, d.currency, d.principal, d.start_date,
+                        d.maturity_date, d.annual_rate,
+                        CASE d.status WHEN 'active' THEN '有效' WHEN 'matured' THEN '已到期'
+                             WHEN 'cancelled' THEN '已取消' ELSE d.status END,
+                        d.matured_at, d.proceeds
+                 FROM deposits d JOIN accounts a ON a.id = d.account_id
+                 ORDER BY d.maturity_date",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    type LotRow = (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        f64,
+        f64,
+        Option<String>,
+        String,
+        String,
+    );
+    let lots: Vec<LotRow> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT l.id, p.name, p.code, a.institution, l.purchase_date,
+                        l.original_amount, COALESCE(l.remaining_amount, l.original_amount),
+                        l.end_date,
+                        CASE l.status WHEN 'active' THEN '持有' WHEN 'closed' THEN '结束'
+                             WHEN 'reversed' THEN '已冲销' ELSE l.status END,
+                        CASE l.source WHEN 'manual' THEN '手工' ELSE 'Excel' END
+                 FROM position_lots l
+                 JOIN products p ON p.id = l.product_id
+                 JOIN accounts a ON a.id = l.account_id
+                 ORDER BY l.purchase_date, l.id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    type ValuationRow = (String, String, String, String, String, f64, bool, String);
+    let valuations: Vec<ValuationRow> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT p.name, p.code, a.institution, v.currency, v.valuation_date,
+                        v.market_value, v.is_current,
+                        CASE v.source WHEN 'manual' THEN '手工' ELSE 'Excel' END
+                 FROM valuations v
+                 JOIN products p ON p.id = v.product_id
+                 JOIN accounts a ON a.id = v.account_id
+                 ORDER BY v.valuation_date, v.id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get(7)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+
+    let (title, subtitle, header, money, percent, date, linked_formula) = export_formats();
+    let heading_formats = ExportHeadingFormats {
+        title: &title,
+        subtitle: &subtitle,
+        header: &header,
+    };
+    let export_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut workbook = Workbook::new();
+
+    {
+        let sheet = workbook
+            .add_worksheet()
+            .set_name("资产概览")
+            .map_err(|error| error.to_string())?;
+        sheet.set_screen_gridlines(false);
+        sheet
+            .merge_range(0, 0, 0, 5, "稳盈 · 资产数据导出", &title)
+            .map_err(|error| error.to_string())?;
+        sheet
+            .merge_range(
+                1,
+                0,
+                1,
+                5,
+                &format!("导出时间：{export_time}｜金额单位：原币"),
+                &subtitle,
+            )
+            .map_err(|error| error.to_string())?;
+        for (column, value) in [
+            "币种",
+            "理财市值",
+            "定期存款",
+            "总资产",
+            "持仓成本",
+            "持有收益",
+        ]
+        .iter()
+        .enumerate()
+        {
+            sheet
+                .write_string_with_format(3, column as u16, *value, &header)
+                .map_err(|error| error.to_string())?;
+        }
+        let holding_end = (holdings.len() + 3).max(4);
+        let deposit_end = (deposits.len() + 3).max(4);
+        for (index, currency) in ["CNY", "USD"].iter().enumerate() {
+            let row = 4 + index as u32;
+            let excel_row = row + 1;
+            let wealth_value: f64 = holdings
+                .iter()
+                .filter(|item| item.2 == *currency)
+                .map(|item| item.5)
+                .sum();
+            let deposit_value: f64 = deposits
+                .iter()
+                .filter(|item| item.2 == *currency && item.7 == "有效")
+                .map(|item| item.3)
+                .sum();
+            let holding_cost: f64 = holdings
+                .iter()
+                .filter(|item| item.2 == *currency)
+                .map(|item| item.4)
+                .sum();
+            sheet
+                .write_string(row, 0, *currency)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_formula_with_format(
+                    row,
+                    1,
+                    Formula::new(format!("=SUMIF('当前持仓'!$C$4:$C${holding_end},A{excel_row},'当前持仓'!$F$4:$F${holding_end})"))
+                        .set_result(wealth_value.to_string()),
+                    &linked_formula,
+                )
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_formula_with_format(
+                    row,
+                    2,
+                    Formula::new(format!("=SUMIFS('定期存款'!$D$4:$D${deposit_end},'定期存款'!$C$4:$C${deposit_end},A{excel_row},'定期存款'!$H$4:$H${deposit_end},\"有效\")"))
+                        .set_result(deposit_value.to_string()),
+                    &linked_formula,
+                )
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_formula_with_format(
+                    row,
+                    3,
+                    Formula::new(format!("=B{excel_row}+C{excel_row}"))
+                        .set_result((wealth_value + deposit_value).to_string()),
+                    &linked_formula,
+                )
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_formula_with_format(
+                    row,
+                    4,
+                    Formula::new(format!("=SUMIF('当前持仓'!$C$4:$C${holding_end},A{excel_row},'当前持仓'!$E$4:$E${holding_end})"))
+                        .set_result(holding_cost.to_string()),
+                    &linked_formula,
+                )
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_formula_with_format(
+                    row,
+                    5,
+                    Formula::new(format!("=B{excel_row}-E{excel_row}"))
+                        .set_result((wealth_value - holding_cost).to_string()),
+                    &linked_formula,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        sheet
+            .set_column_width(0, 12)
+            .map_err(|error| error.to_string())?;
+        for column in 1..=5 {
+            sheet
+                .set_column_width(column, 18)
+                .map_err(|error| error.to_string())?;
+        }
+        sheet
+            .write_string(8, 0, "说明")
+            .map_err(|error| error.to_string())?;
+        sheet
+            .merge_range(
+                9,
+                0,
+                10,
+                5,
+                "绿色数字为跨工作表公式，可在 Excel 中追溯。当前市值取最新有效快照；已冲销交易仍保留在交易流水中。",
+                &subtitle,
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    {
+        let sheet = workbook
+            .add_worksheet()
+            .set_name("当前持仓")
+            .map_err(|error| error.to_string())?;
+        sheet.set_screen_gridlines(false);
+        let headers = [
+            "产品名称",
+            "产品代码",
+            "币种",
+            "购买渠道",
+            "剩余成本",
+            "当前市值",
+            "持有收益",
+            "收益率",
+            "估值日期",
+        ];
+        write_export_heading(
+            sheet,
+            "当前持仓",
+            &format!("截至 {export_time}"),
+            8,
+            &heading_formats,
+            &headers,
+        )?;
+        for (index, item) in holdings.iter().enumerate() {
+            let row = index as u32 + 3;
+            sheet
+                .write_string(row, 0, &item.0)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 1, &item.1)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 2, &item.2)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 3, &item.3)
+                .map_err(|error| error.to_string())?;
+            for (column, value) in [(4, item.4), (5, item.5), (6, item.6)] {
+                sheet
+                    .write_number_with_format(row, column, value, &money)
+                    .map_err(|error| error.to_string())?;
+            }
+            sheet
+                .write_number_with_format(row, 7, item.7, &percent)
+                .map_err(|error| error.to_string())?;
+            write_export_date(sheet, row, 8, &item.8, &date)?;
+        }
+        for (column, width) in [50.0, 25.0, 9.0, 16.0, 16.0, 16.0, 16.0, 12.0, 13.0]
+            .iter()
+            .enumerate()
+        {
+            sheet
+                .set_column_width(column as u16, *width)
+                .map_err(|error| error.to_string())?;
+        }
+        sheet
+            .autofilter(2, 0, (holdings.len() + 2) as u32, 8)
+            .map_err(|error| error.to_string())?;
+    }
+
+    {
+        let sheet = workbook
+            .add_worksheet()
+            .set_name("交易流水")
+            .map_err(|error| error.to_string())?;
+        sheet.set_screen_gridlines(false);
+        let headers = [
+            "ID",
+            "日期",
+            "操作",
+            "产品/存款",
+            "代码",
+            "银行",
+            "币种",
+            "现金金额",
+            "核销成本",
+            "已实现收益",
+            "来源",
+            "状态",
+            "备注",
+            "冲销原交易",
+            "被冲销交易",
+        ];
+        write_export_heading(
+            sheet,
+            "交易流水",
+            "原始交易和冲销记录完整保留",
+            14,
+            &heading_formats,
+            &headers,
+        )?;
+        for (index, item) in transactions.iter().enumerate() {
+            let row = index as u32 + 3;
+            sheet
+                .write_number(row, 0, item.0 as f64)
+                .map_err(|error| error.to_string())?;
+            write_export_date(sheet, row, 1, &item.1, &date)?;
+            sheet
+                .write_string(row, 2, &item.2)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 3, &item.3)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 4, item.4.as_deref().unwrap_or(""))
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 5, item.5.as_deref().unwrap_or(""))
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 6, &item.6)
+                .map_err(|error| error.to_string())?;
+            for (column, value) in [(7, item.7), (8, item.8), (9, item.9)] {
+                sheet
+                    .write_number_with_format(row, column, value, &money)
+                    .map_err(|error| error.to_string())?;
+            }
+            sheet
+                .write_string(row, 10, &item.10)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 11, &item.11)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 12, item.12.as_deref().unwrap_or(""))
+                .map_err(|error| error.to_string())?;
+            if let Some(value) = item.13 {
+                sheet
+                    .write_number(row, 13, value as f64)
+                    .map_err(|error| error.to_string())?;
+            }
+            if let Some(value) = item.14 {
+                sheet
+                    .write_number(row, 14, value as f64)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        for (column, width) in [
+            8.0, 13.0, 16.0, 50.0, 25.0, 16.0, 9.0, 15.0, 15.0, 16.0, 10.0, 12.0, 40.0, 12.0, 12.0,
+        ]
+        .iter()
+        .enumerate()
+        {
+            sheet
+                .set_column_width(column as u16, *width)
+                .map_err(|error| error.to_string())?;
+        }
+        sheet
+            .autofilter(2, 0, (transactions.len() + 2) as u32, 14)
+            .map_err(|error| error.to_string())?;
+    }
+
+    {
+        let sheet = workbook
+            .add_worksheet()
+            .set_name("定期存款")
+            .map_err(|error| error.to_string())?;
+        sheet.set_screen_gridlines(false);
+        let headers = [
+            "存款名称",
+            "银行",
+            "币种",
+            "本金",
+            "起息日",
+            "到期日",
+            "年利率",
+            "状态",
+            "结清日",
+            "到账金额",
+        ];
+        write_export_heading(
+            sheet,
+            "定期存款",
+            "包含有效、已到期和已取消记录",
+            9,
+            &heading_formats,
+            &headers,
+        )?;
+        for (index, item) in deposits.iter().enumerate() {
+            let row = index as u32 + 3;
+            sheet
+                .write_string(row, 0, &item.0)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 1, &item.1)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 2, &item.2)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_number_with_format(row, 3, item.3, &money)
+                .map_err(|error| error.to_string())?;
+            if let Some(value) = &item.4 {
+                write_export_date(sheet, row, 4, value, &date)?;
+            }
+            write_export_date(sheet, row, 5, &item.5, &date)?;
+            sheet
+                .write_number_with_format(row, 6, item.6, &percent)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 7, &item.7)
+                .map_err(|error| error.to_string())?;
+            if let Some(value) = &item.8 {
+                write_export_date(sheet, row, 8, value, &date)?;
+            }
+            if let Some(value) = item.9 {
+                sheet
+                    .write_number_with_format(row, 9, value, &money)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        for (column, width) in [36.0, 16.0, 9.0, 16.0, 13.0, 13.0, 11.0, 12.0, 13.0, 16.0]
+            .iter()
+            .enumerate()
+        {
+            sheet
+                .set_column_width(column as u16, *width)
+                .map_err(|error| error.to_string())?;
+        }
+        sheet
+            .autofilter(2, 0, (deposits.len() + 2) as u32, 9)
+            .map_err(|error| error.to_string())?;
+    }
+
+    {
+        let sheet = workbook
+            .add_worksheet()
+            .set_name("买入批次")
+            .map_err(|error| error.to_string())?;
+        sheet.set_screen_gridlines(false);
+        let headers = [
+            "批次ID",
+            "产品名称",
+            "产品代码",
+            "购买渠道",
+            "买入日期",
+            "原始成本",
+            "剩余成本",
+            "结束日期",
+            "状态",
+            "来源",
+        ];
+        write_export_heading(
+            sheet,
+            "买入批次",
+            "FIFO 成本核销审计明细",
+            9,
+            &heading_formats,
+            &headers,
+        )?;
+        for (index, item) in lots.iter().enumerate() {
+            let row = index as u32 + 3;
+            sheet
+                .write_number(row, 0, item.0 as f64)
+                .map_err(|error| error.to_string())?;
+            for (column, value) in [
+                (1, item.1.as_str()),
+                (2, item.2.as_str()),
+                (3, item.3.as_str()),
+            ] {
+                sheet
+                    .write_string(row, column, value)
+                    .map_err(|error| error.to_string())?;
+            }
+            write_export_date(sheet, row, 4, &item.4, &date)?;
+            sheet
+                .write_number_with_format(row, 5, item.5, &money)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_number_with_format(row, 6, item.6, &money)
+                .map_err(|error| error.to_string())?;
+            if let Some(value) = &item.7 {
+                write_export_date(sheet, row, 7, value, &date)?;
+            }
+            sheet
+                .write_string(row, 8, &item.8)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 9, &item.9)
+                .map_err(|error| error.to_string())?;
+        }
+        for (column, width) in [9.0, 50.0, 25.0, 16.0, 13.0, 16.0, 16.0, 13.0, 12.0, 10.0]
+            .iter()
+            .enumerate()
+        {
+            sheet
+                .set_column_width(column as u16, *width)
+                .map_err(|error| error.to_string())?;
+        }
+        sheet
+            .autofilter(2, 0, (lots.len() + 2) as u32, 9)
+            .map_err(|error| error.to_string())?;
+    }
+
+    {
+        let sheet = workbook
+            .add_worksheet()
+            .set_name("市值历史")
+            .map_err(|error| error.to_string())?;
+        sheet.set_screen_gridlines(false);
+        let headers = [
+            "产品名称",
+            "产品代码",
+            "购买渠道",
+            "币种",
+            "估值日期",
+            "市值",
+            "是否当前",
+            "来源",
+        ];
+        write_export_heading(
+            sheet,
+            "市值历史",
+            "每次手工更新均保留历史快照",
+            7,
+            &heading_formats,
+            &headers,
+        )?;
+        for (index, item) in valuations.iter().enumerate() {
+            let row = index as u32 + 3;
+            for (column, value) in [
+                (0, item.0.as_str()),
+                (1, item.1.as_str()),
+                (2, item.2.as_str()),
+                (3, item.3.as_str()),
+            ] {
+                sheet
+                    .write_string(row, column, value)
+                    .map_err(|error| error.to_string())?;
+            }
+            write_export_date(sheet, row, 4, &item.4, &date)?;
+            sheet
+                .write_number_with_format(row, 5, item.5, &money)
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 6, if item.6 { "是" } else { "否" })
+                .map_err(|error| error.to_string())?;
+            sheet
+                .write_string(row, 7, &item.7)
+                .map_err(|error| error.to_string())?;
+        }
+        for (column, width) in [50.0, 25.0, 16.0, 9.0, 13.0, 16.0, 11.0, 10.0]
+            .iter()
+            .enumerate()
+        {
+            sheet
+                .set_column_width(column as u16, *width)
+                .map_err(|error| error.to_string())?;
+        }
+        sheet
+            .autofilter(2, 0, (valuations.len() + 2) as u32, 7)
+            .map_err(|error| error.to_string())?;
+    }
+
+    workbook.save(target).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn import_workbook(path: String, state: State<'_, AppState>) -> Result<ImportReport, String> {
     let path = Path::new(&path);
@@ -1004,7 +2333,68 @@ fn import_workbook(path: String, state: State<'_, AppState>) -> Result<ImportRep
         .db
         .lock()
         .map_err(|_| "数据库正在使用中".to_string())?;
+    create_auto_backup(&conn, &state.backup_dir, "pre-import")?;
     parse_workbook(path, &mut conn)
+}
+
+#[tauri::command]
+fn backup_database(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<FileOperationResult, String> {
+    let target = Path::new(&path);
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    backup_to_path(&conn, target)?;
+    Ok(FileOperationResult {
+        path,
+        message: "数据库备份已完成".to_string(),
+    })
+}
+
+#[tauri::command]
+fn restore_database(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<FileOperationResult, String> {
+    let source = Path::new(&path);
+    validate_backup(source)?;
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    let safety_backup = create_auto_backup(&conn, &state.backup_dir, "pre-restore")?;
+    conn.restore(MAIN_DB, source, None::<fn(rusqlite::backup::Progress)>)
+        .map_err(|error| {
+            format!(
+                "恢复失败，原数据库已备份至 {}：{error}",
+                safety_backup.display()
+            )
+        })?;
+    migrate(&conn).map_err(|error| error.to_string())?;
+    Ok(FileOperationResult {
+        path,
+        message: format!("数据库已恢复；恢复前快照保存在 {}", safety_backup.display()),
+    })
+}
+
+#[tauri::command]
+fn export_excel_file(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<FileOperationResult, String> {
+    let target = Path::new(&path);
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    export_excel(&conn, target)?;
+    Ok(FileOperationResult {
+        path,
+        message: "Excel 数据包已导出".to_string(),
+    })
 }
 
 #[tauri::command]
@@ -1186,7 +2576,10 @@ fn list_transactions(state: State<'_, AppState>) -> Result<Vec<TransactionRecord
                     COALESCE(t.cost_basis, 0),
                     COALESCE(t.realized_gain, 0),
                     t.currency,
-                    t.note
+                    t.note,
+                    t.source,
+                    t.reversed_by,
+                    t.reversal_of
              FROM transactions t
              LEFT JOIN products p ON p.id = t.product_id
              LEFT JOIN deposits d ON d.id = t.deposit_id
@@ -1207,11 +2600,88 @@ fn list_transactions(state: State<'_, AppState>) -> Result<Vec<TransactionRecord
                 realized_gain: row.get(7)?,
                 currency: row.get(8)?,
                 note: row.get(9)?,
+                source: row.get(10)?,
+                reversed_by: row.get(11)?,
+                reversal_of: row.get(12)?,
+                can_reverse: row.get::<_, String>(10)? == "manual"
+                    && row.get::<_, Option<i64>>(11)?.is_none()
+                    && row.get::<_, String>(3)? != "REVERSAL",
             })
         })
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_transaction_detail(
+    transaction_id: i64,
+    state: State<'_, AppState>,
+) -> Result<TransactionDetail, String> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    let can_reverse = transaction_can_be_reversed(&conn, transaction_id)?;
+    conn.query_row(
+        "SELECT t.id,
+                COALESCE(p.name, d.name, '未命名交易'),
+                p.code,
+                a.institution,
+                t.transaction_type,
+                t.trade_date,
+                t.amount,
+                COALESCE(t.cost_basis, 0),
+                COALESCE(t.realized_gain, 0),
+                t.currency,
+                t.note,
+                t.source,
+                t.valuation_before,
+                t.valuation_after,
+                t.reversed_by,
+                t.reversal_of
+         FROM transactions t
+         LEFT JOIN products p ON p.id = t.product_id
+         LEFT JOIN deposits d ON d.id = t.deposit_id
+         LEFT JOIN accounts a ON a.id = t.account_id
+         WHERE t.id = ?1",
+        [transaction_id],
+        |row| {
+            Ok(TransactionDetail {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                code: row.get(2)?,
+                institution: row.get(3)?,
+                operation: row.get(4)?,
+                trade_date: row.get(5)?,
+                amount: row.get(6)?,
+                cost_basis: row.get(7)?,
+                realized_gain: row.get(8)?,
+                currency: row.get(9)?,
+                note: row.get(10)?,
+                source: row.get(11)?,
+                valuation_before: row.get(12)?,
+                valuation_after: row.get(13)?,
+                reversed_by: row.get(14)?,
+                reversal_of: row.get(15)?,
+                can_reverse,
+            })
+        },
+    )
+    .map_err(|_| "没有找到该交易".to_string())
+}
+
+#[tauri::command]
+fn reverse_transaction(
+    transaction_id: i64,
+    state: State<'_, AppState>,
+) -> Result<EntryResult, String> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    create_auto_backup(&conn, &state.backup_dir, "pre-reversal")?;
+    reverse_entry(&mut conn, transaction_id)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1222,8 +2692,13 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             fs::create_dir_all(&data_dir)?;
+            let backup_dir = data_dir.join("backups");
+            fs::create_dir_all(&backup_dir)?;
             let mut conn = Connection::open(data_dir.join("wealth-manager.sqlite3"))?;
             migrate(&conn)?;
+            if let Err(error) = ensure_daily_backup(&conn, &backup_dir) {
+                eprintln!("daily backup failed: {error}");
+            }
             if let Ok(import_path) = std::env::var("WEALTH_MANAGER_IMPORT_PATH") {
                 let imported: i64 =
                     conn.query_row("SELECT COUNT(*) FROM import_runs", [], |row| row.get(0))?;
@@ -1238,6 +2713,7 @@ pub fn run() {
             }
             app.manage(AppState {
                 db: Mutex::new(conn),
+                backup_dir,
             });
             Ok(())
         })
@@ -1247,7 +2723,12 @@ pub fn run() {
             list_holdings,
             list_maturities,
             record_entry,
-            list_transactions
+            list_transactions,
+            get_transaction_detail,
+            reverse_transaction,
+            backup_database,
+            restore_database,
+            export_excel_file
         ])
         .run(tauri::generate_context!())
         .expect("failed to run wealth manager");
@@ -1360,6 +2841,14 @@ mod tests {
             annual_rate: None,
             note: None,
         }
+    }
+
+    fn temp_artifact(name: &str, extension: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("wealth-manager-{name}-{nonce}.{extension}"))
     }
 
     #[test]
@@ -1506,5 +2995,139 @@ mod tests {
             )
             .expect("matured status");
         assert_eq!(status, "matured");
+    }
+
+    #[test]
+    fn reversals_restore_fifo_cost_market_value_and_deposit_state() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        apply_entry(&mut conn, &entry("BUY", 10_000.0)).expect("first buy");
+        apply_entry(&mut conn, &entry("BUY", 5_000.0)).expect("second buy");
+        let (product, account): (i64, i64) = conn
+            .query_row(
+                "SELECT product_id, account_id FROM position_lots LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("holding ids");
+        let mut valuation = entry("VALUATION", 0.0);
+        valuation.product_id = Some(product);
+        valuation.account_id = Some(account);
+        valuation.market_value = Some(16_500.0);
+        apply_entry(&mut conn, &valuation).expect("valuation");
+        let mut sale = entry("SELL", 5_500.0);
+        sale.product_id = Some(product);
+        sale.account_id = Some(account);
+        apply_entry(&mut conn, &sale).expect("sale");
+        let sale_id: i64 = conn
+            .query_row(
+                "SELECT id FROM transactions WHERE transaction_type = 'SELL'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sale id");
+        assert!(transaction_can_be_reversed(&conn, sale_id).expect("reversible sale"));
+        reverse_entry(&mut conn, sale_id).expect("reverse sale");
+        let (cost, market): (f64, f64) = conn
+            .query_row(
+                "SELECT (SELECT SUM(remaining_amount) FROM position_lots WHERE status = 'active'),
+                        (SELECT market_value FROM valuations WHERE is_current = 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("restored holding");
+        assert!((cost - 15_000.0).abs() < 0.01);
+        assert!((market - 16_500.0).abs() < 0.01);
+
+        let mut open = entry("DEPOSIT_OPEN", 100_000.0);
+        open.product_name = Some("测试定存".to_string());
+        open.maturity_date = Some("2029-08-07".to_string());
+        open.annual_rate = Some(0.02);
+        apply_entry(&mut conn, &open).expect("open deposit");
+        let deposit: i64 = conn
+            .query_row("SELECT id FROM deposits", [], |row| row.get(0))
+            .expect("deposit id");
+        let mut maturity = entry("DEPOSIT_MATURITY", 106_000.0);
+        maturity.deposit_id = Some(deposit);
+        apply_entry(&mut conn, &maturity).expect("mature deposit");
+        let maturity_id: i64 = conn
+            .query_row(
+                "SELECT id FROM transactions WHERE transaction_type = 'DEPOSIT_MATURITY'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("maturity id");
+        reverse_entry(&mut conn, maturity_id).expect("reverse maturity");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM deposits WHERE id = ?1",
+                [deposit],
+                |row| row.get(0),
+            )
+            .expect("deposit status");
+        assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn database_backup_restores_a_consistent_snapshot() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        apply_entry(&mut conn, &entry("BUY", 10_000.0)).expect("first buy");
+        let backup_path = temp_artifact("backup", "sqlite3");
+        backup_to_path(&conn, &backup_path).expect("create backup");
+        validate_backup(&backup_path).expect("validate backup");
+        apply_entry(&mut conn, &entry("BUY", 5_000.0)).expect("second buy");
+        conn.restore(
+            MAIN_DB,
+            &backup_path,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
+        .expect("restore backup");
+        let lots: i64 = conn
+            .query_row("SELECT COUNT(*) FROM position_lots", [], |row| row.get(0))
+            .expect("lot count");
+        assert_eq!(lots, 1);
+        fs::remove_file(backup_path).expect("remove test backup");
+    }
+
+    #[test]
+    fn excel_export_contains_auditable_sheets_and_formulas() {
+        let workbook_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../理财.xlsx");
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        parse_workbook(&workbook_path, &mut conn).expect("import workbook");
+        let preserved_export = std::env::var("WEALTH_MANAGER_TEST_EXPORT_PATH").ok();
+        let export_path = preserved_export
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temp_artifact("export", "xlsx"));
+        export_excel(&conn, &export_path).expect("export workbook");
+
+        let mut exported = open_workbook_auto(&export_path).expect("open exported workbook");
+        let names = exported.sheet_names().to_vec();
+        assert_eq!(
+            names,
+            vec![
+                "资产概览",
+                "当前持仓",
+                "交易流水",
+                "定期存款",
+                "买入批次",
+                "市值历史"
+            ]
+        );
+        let holdings = exported.worksheet_range("当前持仓").expect("holding sheet");
+        assert_eq!(text(holdings.get((2, 0))), "产品名称");
+        assert!(holdings.height() > 20);
+        let formulas = exported
+            .worksheet_formula("资产概览")
+            .expect("summary formulas");
+        assert!(formulas
+            .rows()
+            .flatten()
+            .any(|formula| formula.contains("SUMIF")));
+        if preserved_export.is_none() {
+            fs::remove_file(export_path).expect("remove test export");
+        }
     }
 }
