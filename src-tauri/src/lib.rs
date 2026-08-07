@@ -54,6 +54,78 @@ struct Holding {
     gain_rate: f64,
     valuation_date: String,
     status: String,
+    days_since_valuation: i64,
+    seven_day_return: Option<f64>,
+    thirty_day_return: Option<f64>,
+    signal: String,
+    signal_label: String,
+    signal_reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ValuationUpdateItem {
+    product_id: i64,
+    account_id: i64,
+    market_value: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchValuationInput {
+    valuation_date: String,
+    items: Vec<ValuationUpdateItem>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchValuationResult {
+    updated: usize,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValuationHistoryPoint {
+    id: i64,
+    date: String,
+    market_value: f64,
+    change_amount: Option<f64>,
+    change_rate: Option<f64>,
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HoldingDetail {
+    product_id: i64,
+    account_id: i64,
+    name: String,
+    code: String,
+    channel: String,
+    currency: String,
+    cost: f64,
+    market_value: f64,
+    gain: f64,
+    gain_rate: f64,
+    valuation_date: String,
+    days_since_valuation: i64,
+    seven_day_return: Option<f64>,
+    thirty_day_return: Option<f64>,
+    signal: String,
+    signal_label: String,
+    signal_reason: String,
+    history: Vec<ValuationHistoryPoint>,
+}
+
+struct HoldingInsight {
+    days_since_valuation: i64,
+    seven_day_return: Option<f64>,
+    thirty_day_return: Option<f64>,
+    signal: String,
+    signal_label: String,
+    signal_reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -671,6 +743,254 @@ fn replace_current_valuation(
         params![product, account, date, value.max(0.0), currency, transaction_id],
     )?;
     Ok(())
+}
+
+fn compounded_valuation_return(
+    conn: &Connection,
+    product: i64,
+    account: i64,
+    since: NaiveDate,
+) -> Result<Option<f64>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT valuation_before, valuation_after
+             FROM transactions
+             WHERE product_id = ?1 AND account_id = ?2
+               AND transaction_type = 'VALUATION' AND reversed_by IS NULL
+               AND trade_date >= ?3 AND valuation_before > 0.000001
+             ORDER BY trade_date, id",
+        )
+        .map_err(|error| error.to_string())?;
+    let changes = statement
+        .query_map(
+            params![product, account, since.format("%Y-%m-%d").to_string()],
+            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?)),
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        changes
+            .iter()
+            .fold(1.0, |factor, (before, after)| factor * (after / before))
+            - 1.0,
+    ))
+}
+
+fn holding_insight(
+    conn: &Connection,
+    product: i64,
+    account: i64,
+    currency: &str,
+    market_value: f64,
+    gain_rate: f64,
+    valuation_date: &str,
+) -> Result<HoldingInsight, String> {
+    let today = Local::now().date_naive();
+    let valued_on = NaiveDate::parse_from_str(valuation_date, "%Y-%m-%d").unwrap_or(today);
+    let days_since_valuation = (today - valued_on).num_days().max(0);
+    let seven_day_return = compounded_valuation_return(
+        conn,
+        product,
+        account,
+        today.checked_sub_signed(Duration::days(7)).unwrap_or(today),
+    )?;
+    let thirty_day_return = compounded_valuation_return(
+        conn,
+        product,
+        account,
+        today
+            .checked_sub_signed(Duration::days(30))
+            .unwrap_or(today),
+    )?;
+    let observations: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM transactions
+             WHERE product_id = ?1 AND account_id = ?2
+               AND transaction_type = 'VALUATION' AND reversed_by IS NULL",
+            params![product, account],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let risk_level: Option<String> = conn
+        .query_row(
+            "SELECT risk_level FROM products WHERE id = ?1",
+            [product],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .flatten();
+    let currency_assets: f64 = conn
+        .query_row(
+            "SELECT
+               (SELECT COALESCE(SUM(market_value), 0) FROM valuations
+                WHERE is_current = 1 AND currency = ?1) +
+               (SELECT COALESCE(SUM(principal), 0) FROM deposits
+                WHERE status = 'active' AND currency = ?1)",
+            [currency],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let exposure = if currency_assets > 0.000_001 {
+        market_value / currency_assets
+    } else {
+        0.0
+    };
+    let low_risk = risk_level
+        .as_deref()
+        .map(|value| {
+            let normalized = value.trim().to_uppercase();
+            matches!(normalized.as_str(), "R1" | "R2")
+                || normalized.contains("低风险")
+                || normalized.contains("中低风险")
+        })
+        .unwrap_or(false);
+    let thirty = thirty_day_return.unwrap_or_default();
+    let seven = seven_day_return.unwrap_or_default();
+    let (signal, signal_label, signal_reason) = if days_since_valuation > 10 {
+        (
+            "UPDATE",
+            "待更新",
+            format!("市值已 {days_since_valuation} 天未更新，先补充最新数据再判断"),
+        )
+    } else if observations < 2 {
+        (
+            "OBSERVE",
+            "积累数据",
+            "有效估值次数不足 2 次，暂不根据单点数据给出买卖方向".to_string(),
+        )
+    } else if thirty <= -0.005 || gain_rate <= -0.015 {
+        (
+            "REVIEW",
+            "评估赎回",
+            format!(
+                "近30日变化 {}、累计收益 {}，建议核对风险、期限和赎回费用",
+                format_percent_for_reason(thirty),
+                format_percent_for_reason(gain_rate)
+            ),
+        )
+    } else if gain_rate >= 0.03 && seven < 0.0 && thirty < 0.0 {
+        (
+            "TAKE_PROFIT",
+            "考虑止盈",
+            format!(
+                "累计收益 {}，但近7日转弱至 {}，可评估分批锁定收益",
+                format_percent_for_reason(gain_rate),
+                format_percent_for_reason(seven)
+            ),
+        )
+    } else if low_risk
+        && observations >= 3
+        && (0.001..=0.02).contains(&thirty)
+        && gain_rate > 0.0
+        && exposure < 0.25
+    {
+        (
+            "ADD_WATCH",
+            "关注加仓",
+            format!(
+                "近30日平稳为正且当前占比约 {:.0}%；加仓前仍需核对流动性与资金期限",
+                exposure * 100.0
+            ),
+        )
+    } else {
+        (
+            "HOLD",
+            "继续观察",
+            format!(
+                "近30日变化 {}，尚未触发回撤、止盈或低风险加仓观察条件",
+                format_percent_for_reason(thirty)
+            ),
+        )
+    };
+    Ok(HoldingInsight {
+        days_since_valuation,
+        seven_day_return,
+        thirty_day_return,
+        signal: signal.to_string(),
+        signal_label: signal_label.to_string(),
+        signal_reason,
+    })
+}
+
+fn format_percent_for_reason(value: f64) -> String {
+    format!("{:+.2}%", value * 100.0)
+}
+
+fn apply_batch_valuations(
+    conn: &mut Connection,
+    input: &BatchValuationInput,
+) -> Result<BatchValuationResult, String> {
+    let valuation_date = valid_date(&input.valuation_date, "估值日期")?;
+    if input.items.is_empty() {
+        return Err("请至少提供一笔市值".to_string());
+    }
+    let mut keys = std::collections::HashSet::new();
+    for item in &input.items {
+        if !item.market_value.is_finite() || item.market_value < 0.0 {
+            return Err("市值必须是大于或等于0的有效数字".to_string());
+        }
+        if !keys.insert((item.product_id, item.account_id)) {
+            return Err("批量市值中存在重复持仓".to_string());
+        }
+    }
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    for item in &input.items {
+        let (currency, name): (String, String) = tx
+            .query_row(
+                "SELECT p.currency, p.name FROM products p
+                 WHERE p.id = ?1 AND EXISTS (
+                   SELECT 1 FROM position_lots l
+                   WHERE l.product_id = p.id AND l.account_id = ?2 AND l.status = 'active'
+                 )",
+                params![item.product_id, item.account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| "批量列表中包含已经结清或不存在的持仓".to_string())?;
+        let previous = current_market_value(&tx, item.product_id, item.account_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{name} 缺少当前市值"))?;
+        tx.execute(
+            "INSERT INTO transactions
+               (product_id, account_id, transaction_type, trade_date, amount, currency, note,
+                valuation_before, valuation_after, source)
+             VALUES (?1, ?2, 'VALUATION', ?3, ?4, ?5, ?6, ?7, ?4, 'manual')",
+            params![
+                item.product_id,
+                item.account_id,
+                valuation_date,
+                item.market_value,
+                currency,
+                input
+                    .note
+                    .as_deref()
+                    .filter(|note| !note.trim().is_empty())
+                    .unwrap_or("批量更新市值"),
+                previous
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        let transaction_id = tx.last_insert_rowid();
+        replace_current_valuation(
+            &tx,
+            item.product_id,
+            item.account_id,
+            &valuation_date,
+            item.market_value,
+            &currency,
+            Some(transaction_id),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(BatchValuationResult {
+        updated: input.items.len(),
+        message: format!("已更新 {} 个持仓的市值", input.items.len()),
+    })
 }
 
 fn holding_currency(tx: &Transaction<'_>, product: i64, account: i64) -> Result<String, String> {
@@ -3440,11 +3760,168 @@ fn list_holdings(state: State<'_, AppState>) -> Result<Vec<Holding>, String> {
                 },
                 valuation_date: row.get(9)?,
                 status: "持有中".to_string(),
+                days_since_valuation: 0,
+                seven_day_return: None,
+                thirty_day_return: None,
+                signal: String::new(),
+                signal_label: String::new(),
+                signal_reason: String::new(),
             })
         })
         .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+    let mut holdings = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for holding in &mut holdings {
+        let insight = holding_insight(
+            &conn,
+            holding.product_id,
+            holding.account_id,
+            &holding.currency,
+            holding.market_value,
+            holding.gain_rate,
+            &holding.valuation_date,
+        )?;
+        holding.days_since_valuation = insight.days_since_valuation;
+        holding.seven_day_return = insight.seven_day_return;
+        holding.thirty_day_return = insight.thirty_day_return;
+        holding.signal = insight.signal;
+        holding.signal_label = insight.signal_label;
+        holding.signal_reason = insight.signal_reason;
+    }
+    Ok(holdings)
+}
+
+#[tauri::command]
+fn record_batch_valuations(
+    input: BatchValuationInput,
+    state: State<'_, AppState>,
+) -> Result<BatchValuationResult, String> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    create_auto_backup(&conn, &state.backup_dir, "pre-batch-valuation")?;
+    apply_batch_valuations(&mut conn, &input)
+}
+
+#[tauri::command]
+fn get_holding_detail(
+    product_id: i64,
+    account_id: i64,
+    state: State<'_, AppState>,
+) -> Result<HoldingDetail, String> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    let (name, code, channel, currency, cost, market_value, valuation_date): (
+        String,
+        String,
+        String,
+        String,
+        f64,
+        f64,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT p.name, p.code, a.institution, v.currency,
+                    COALESCE((
+                      SELECT SUM(COALESCE(l.remaining_amount, l.original_amount))
+                      FROM position_lots l
+                      WHERE l.product_id = p.id AND l.account_id = a.id AND l.status = 'active'
+                    ), 0),
+                    v.market_value, v.valuation_date
+             FROM valuations v
+             JOIN products p ON p.id = v.product_id
+             JOIN accounts a ON a.id = v.account_id
+             WHERE v.product_id = ?1 AND v.account_id = ?2 AND v.is_current = 1",
+            params![product_id, account_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .map_err(|_| "没有找到该持仓".to_string())?;
+    let gain = market_value - cost;
+    let gain_rate = if cost.abs() > f64::EPSILON {
+        gain / cost
+    } else {
+        0.0
+    };
+    let insight = holding_insight(
+        &conn,
+        product_id,
+        account_id,
+        &currency,
+        market_value,
+        gain_rate,
+        &valuation_date,
+    )?;
+    let history = {
+        let mut statement = conn
+            .prepare(
+                "SELECT v.id, v.valuation_date, v.market_value,
+                        CASE WHEN t.transaction_type = 'VALUATION' AND t.reversed_by IS NULL
+                             THEN t.valuation_after - t.valuation_before END,
+                        CASE WHEN t.transaction_type = 'VALUATION' AND t.reversed_by IS NULL
+                                   AND t.valuation_before > 0.000001
+                             THEN (t.valuation_after - t.valuation_before) / t.valuation_before END,
+                        CASE WHEN t.transaction_type = 'VALUATION' AND t.reversed_by IS NOT NULL
+                             THEN '已冲销估值'
+                             WHEN t.transaction_type = 'VALUATION' THEN '手工估值'
+                             WHEN v.source = 'excel' THEN 'Excel导入'
+                             ELSE '交易调整' END
+                 FROM valuations v
+                 LEFT JOIN transactions t ON t.id = v.transaction_id
+                 WHERE v.product_id = ?1 AND v.account_id = ?2
+                 ORDER BY v.valuation_date, v.id",
+            )
+            .map_err(|error| error.to_string())?;
+        let points = statement
+            .query_map(params![product_id, account_id], |row| {
+                Ok(ValuationHistoryPoint {
+                    id: row.get(0)?,
+                    date: row.get(1)?,
+                    market_value: row.get(2)?,
+                    change_amount: row.get(3)?,
+                    change_rate: row.get(4)?,
+                    source: row.get(5)?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        points
+    };
+    Ok(HoldingDetail {
+        product_id,
+        account_id,
+        name,
+        code,
+        channel,
+        currency,
+        cost,
+        market_value,
+        gain,
+        gain_rate,
+        valuation_date,
+        days_since_valuation: insight.days_since_valuation,
+        seven_day_return: insight.seven_day_return,
+        thirty_day_return: insight.thirty_day_return,
+        signal: insight.signal,
+        signal_label: insight.signal_label,
+        signal_reason: insight.signal_reason,
+        history,
+    })
 }
 
 #[tauri::command]
@@ -3662,6 +4139,8 @@ pub fn run() {
             import_workbook,
             get_dashboard,
             list_holdings,
+            record_batch_valuations,
+            get_holding_detail,
             list_maturities,
             record_entry,
             list_transactions,
@@ -4199,5 +4678,93 @@ mod tests {
         let end = NaiveDate::from_ymd_opt(2026, 1, 1).expect("end date");
         let result = calculate_xirr(&[(start, -1_000.0), (end, 1_100.0)]).expect("xirr");
         assert!((result - 0.1).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn batch_valuations_update_all_holdings_and_measure_flow_adjusted_returns() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        apply_entry(&mut conn, &entry("BUY", 10_000.0)).expect("first holding");
+        let mut second_buy = entry("BUY", 5_000.0);
+        second_buy.product_name = Some("第二个测试理财".to_string());
+        second_buy.product_code = Some("TEST002".to_string());
+        second_buy.institution = Some("另一家测试银行".to_string());
+        apply_entry(&mut conn, &second_buy).expect("second holding");
+        let holdings = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT product_id, account_id, original_amount
+                     FROM position_lots ORDER BY original_amount DESC",
+                )
+                .expect("prepare holdings");
+            let result = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                })
+                .expect("query holdings")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect holdings");
+            result
+        };
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let first = BatchValuationInput {
+            valuation_date: today.clone(),
+            items: holdings
+                .iter()
+                .map(|(product, account, cost)| ValuationUpdateItem {
+                    product_id: *product,
+                    account_id: *account,
+                    market_value: cost * 1.01,
+                })
+                .collect(),
+            note: Some("第一次周度估值".to_string()),
+        };
+        let result = apply_batch_valuations(&mut conn, &first).expect("first batch");
+        assert_eq!(result.updated, 2);
+        let second = BatchValuationInput {
+            valuation_date: today,
+            items: holdings
+                .iter()
+                .map(|(product, account, cost)| ValuationUpdateItem {
+                    product_id: *product,
+                    account_id: *account,
+                    market_value: cost * 1.02,
+                })
+                .collect(),
+            note: None,
+        };
+        apply_batch_valuations(&mut conn, &second).expect("second batch");
+        let valuation_transactions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'VALUATION'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("valuation count");
+        assert_eq!(valuation_transactions, 4);
+        let current_valuations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM valuations WHERE is_current = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("current valuation count");
+        assert_eq!(current_valuations, 2);
+        let return_rate = compounded_valuation_return(
+            &conn,
+            holdings[0].0,
+            holdings[0].1,
+            Local::now()
+                .date_naive()
+                .checked_sub_signed(Duration::days(30))
+                .expect("lookback"),
+        )
+        .expect("return calculation")
+        .expect("return exists");
+        assert!((return_rate - 0.02).abs() < 0.000_001);
     }
 }

@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
+  Activity,
   BarChart3,
   BellRing,
   CalendarDays,
@@ -20,6 +21,7 @@ import {
   Save,
   ShieldCheck,
   Settings2,
+  Sparkles,
   WalletCards,
   X,
 } from "lucide-react";
@@ -60,7 +62,18 @@ type Holding = {
   gainRate: number;
   valuationDate: string;
   status: string;
+  daysSinceValuation: number;
+  sevenDayReturn: number | null;
+  thirtyDayReturn: number | null;
+  signal: string;
+  signalLabel: string;
+  signalReason: string;
 };
+
+type ValuationHistoryPoint = { id: number; date: string; marketValue: number; changeAmount: number | null; changeRate: number | null; source: string };
+type HoldingDetail = Omit<Holding, "id" | "status"> & { history: ValuationHistoryPoint[] };
+type BatchValuationInput = { valuationDate: string; items: { productId: number; accountId: number; marketValue: number }[]; note: string | null };
+type BatchValuationResult = { updated: number; message: string };
 
 type TransactionRecord = {
   id: number;
@@ -200,10 +213,13 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<ImportReport | null>(null);
   const [entryOpen, setEntryOpen] = useState(false);
+  const [batchValuationOpen, setBatchValuationOpen] = useState(false);
   const [dataOpen, setDataOpen] = useState(false);
   const [transactionDetail, setTransactionDetail] = useState<TransactionDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [editingRecord, setEditingRecord] = useState<EditableRecord | null>(null);
+  const [holdingDetail, setHoldingDetail] = useState<HoldingDetail | null>(null);
+  const [holdingDetailLoading, setHoldingDetailLoading] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -390,6 +406,33 @@ function App() {
     }
   };
 
+  const saveBatchValuations = async (input: BatchValuationInput) => {
+    setError(null);
+    setLoading(true);
+    try {
+      const result = await invoke<BatchValuationResult>("record_batch_valuations", { input });
+      setNotice(result.message);
+      setBatchValuationOpen(false);
+      await refresh();
+    } catch (reason) {
+      setError(String(reason));
+      setLoading(false);
+      throw reason;
+    }
+  };
+
+  const openHoldingDetail = async (holding: Holding) => {
+    setHoldingDetailLoading(true);
+    setError(null);
+    try {
+      setHoldingDetail(await invoke<HoldingDetail>("get_holding_detail", { productId: holding.productId, accountId: holding.accountId }));
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setHoldingDetailLoading(false);
+    }
+  };
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -440,7 +483,7 @@ function App() {
                 upcoming={upcoming}
               />
             )}
-            {view === "holdings" && <HoldingsView holdings={holdings} />}
+            {view === "holdings" && <HoldingsView holdings={holdings} onBatchUpdate={() => setBatchValuationOpen(true)} onSelect={(holding) => void openHoldingDetail(holding)} loading={holdingDetailLoading} />}
             {view === "transactions" && <TransactionsView transactions={transactions} onSelect={(id) => void openTransaction(id)} loading={detailLoading} />}
             {view === "calendar" && <CalendarView groups={groupedMaturities} />}
             {view === "analytics" && <AnalyticsView analytics={analytics} currency={currency} onCurrencyChange={setCurrency} />}
@@ -475,6 +518,9 @@ function App() {
           onSave={saveEntry}
         />
       )}
+      {batchValuationOpen && (
+        <BatchValuationModal holdings={holdings} onClose={() => setBatchValuationOpen(false)} onSave={saveBatchValuations} />
+      )}
       {dataOpen && (
         <DataSafetyModal
           busy={loading}
@@ -498,6 +544,9 @@ function App() {
           onClose={() => setEditingRecord(null)}
           onSave={saveMasterData}
         />
+      )}
+      {holdingDetail && (
+        <HoldingDetailModal detail={holdingDetail} onClose={() => setHoldingDetail(null)} />
       )}
     </div>
   );
@@ -565,14 +614,91 @@ function Metric({ label, value, detail, positive }: { label: string; value: stri
   return <article className="metric-card"><span>{label}</span><strong className={positive === undefined ? "" : positive ? "gain" : "loss"}>{value}</strong><small>{detail}</small></article>;
 }
 
-function HoldingsView({ holdings }: { holdings: Holding[] }) {
+function HoldingsView({ holdings, onBatchUpdate, onSelect, loading }: { holdings: Holding[]; onBatchUpdate: () => void; onSelect: (holding: Holding) => void; loading: boolean }) {
   return (
     <article className="panel table-panel">
-      <div className="panel-header"><h2>当前持仓</h2><span>{holdings.length}个产品 · 已按产品代码合并分批买入</span></div>
-      <div className="table-scroll"><table><thead><tr><th>产品</th><th>渠道</th><th>币种</th><th className="number">成本</th><th className="number">市值</th><th className="number">收益</th><th className="number">收益率</th><th>状态</th></tr></thead><tbody>
-        {holdings.map((item) => <tr key={`${item.id}-${item.currency}`}><td><strong>{item.name}</strong><span>{item.code}</span></td><td>{item.channel}</td><td>{item.currency}</td><td className="number">{formatMoney(item.cost, item.currency)}</td><td className="number">{formatMoney(item.marketValue, item.currency)}</td><td className={`number ${item.gain >= 0 ? "gain" : "loss"}`}>{formatMoney(item.gain, item.currency)}</td><td className={`number ${item.gainRate >= 0 ? "gain" : "loss"}`}>{formatPercent(item.gainRate)}</td><td><span className="status">{item.status}</span></td></tr>)}
+      <div className="panel-header holdings-header"><div><h2>当前持仓</h2><span>{holdings.length}个产品 · 点击持仓查看市值与收益历史</span></div><button className="button primary valuation-cta" type="button" onClick={onBatchUpdate}><Activity />批量更新市值</button></div>
+      <div className="table-scroll"><table><thead><tr><th>产品</th><th>渠道</th><th className="number">成本</th><th className="number">市值</th><th className="number">持有收益</th><th className="number">近30日</th><th>最近更新</th><th>操作参考</th></tr></thead><tbody>
+        {holdings.map((item) => <tr className="holding-row" aria-busy={loading} key={`${item.id}-${item.currency}`} onClick={() => onSelect(item)}><td><strong>{item.name}</strong><span>{item.code} · {item.currency}</span></td><td>{item.channel}</td><td className="number">{formatMoney(item.cost, item.currency)}</td><td className="number"><strong>{formatMoney(item.marketValue, item.currency)}</strong></td><td className={`number ${item.gain >= 0 ? "gain" : "loss"}`}>{formatMoney(item.gain, item.currency)}<span>{formatPercent(item.gainRate)}</span></td><td className={`number ${item.thirtyDayReturn === null ? "" : item.thirtyDayReturn >= 0 ? "gain" : "loss"}`}>{item.thirtyDayReturn === null ? "—" : formatPercent(item.thirtyDayReturn)}</td><td><span className={item.daysSinceValuation > 10 ? "stale-date" : "fresh-date"}>{item.valuationDate}</span><small>{item.daysSinceValuation === 0 ? "今天" : `${item.daysSinceValuation}天前`}</small></td><td><span className={`signal-badge signal-${item.signal.toLowerCase()}`}>{item.signalLabel}</span><small className="signal-summary">{item.signalReason}</small></td></tr>)}
       </tbody></table></div>
+      <div className="advice-disclaimer"><Sparkles />操作参考仅根据你记录的估值、收益、产品风险等级和持仓占比生成；历史表现不能预测未来，请同时核对期限、赎回规则、费用和个人风险承受能力。</div>
     </article>
+  );
+}
+
+function BatchValuationModal({ holdings, onClose, onSave }: { holdings: Holding[]; onClose: () => void; onSave: (input: BatchValuationInput) => Promise<void> }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const [valuationDate, setValuationDate] = useState(today);
+  const [note, setNote] = useState("");
+  const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(holdings.map((item) => [`${item.productId}:${item.accountId}`, item.marketValue.toString()])));
+  const [submitting, setSubmitting] = useState(false);
+  const changed = holdings.filter((item) => {
+    const next = Number(values[`${item.productId}:${item.accountId}`]);
+    return Number.isFinite(next) && Math.abs(next - item.marketValue) > 0.000001;
+  }).length;
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const items = holdings.map((item) => ({ productId: item.productId, accountId: item.accountId, marketValue: Number(values[`${item.productId}:${item.accountId}`]) }));
+    if (items.some((item) => !Number.isFinite(item.marketValue) || item.marketValue < 0)) return;
+    setSubmitting(true);
+    try {
+      await onSave({ valuationDate, items, note: note.trim() || null });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal batch-valuation-modal" role="dialog" aria-modal="true" aria-labelledby="batch-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-header"><div><h2 id="batch-title">批量更新市值</h2><p>一次完成全部持仓的周度估值；未变化的数值也会留下本次确认记录</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
+        <form onSubmit={(event) => void submit(event)}>
+          <div className="batch-meta"><label>估值日期<input required type="date" value={valuationDate} onChange={(event) => setValuationDate(event.target.value)} /></label><label>备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：周末统一更新" /></label></div>
+          <div className="batch-list"><div className="batch-list-head"><span>产品与渠道</span><span>原市值</span><span>本次市值</span><span>变化</span></div>{holdings.map((item) => {
+            const key = `${item.productId}:${item.accountId}`;
+            const next = Number(values[key]);
+            const difference = Number.isFinite(next) ? next - item.marketValue : 0;
+            return <div className="batch-row" key={key}><div><strong>{item.name}</strong><span>{item.channel} · {item.currency}</span></div><span>{formatMoney(item.marketValue, item.currency)}</span><input required aria-label={`${item.name}本次市值`} type="number" min="0" step="0.01" value={values[key]} onChange={(event) => setValues((current) => ({ ...current, [key]: event.target.value }))} /><b className={difference >= 0 ? "gain" : "loss"}>{difference === 0 ? "—" : `${difference > 0 ? "+" : ""}${formatMoney(difference, item.currency)}`}</b></div>;
+          })}</div>
+          <div className="batch-footer"><div><strong>{holdings.length}</strong> 个持仓将记录本次估值，<strong>{changed}</strong> 个市值发生变化</div><div className="entry-actions"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Save />{submitting ? "保存中…" : "保存全部市值"}</button></div></div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function ValuationHistoryChart({ points, currency }: { points: ValuationHistoryPoint[]; currency: CurrencyCode }) {
+  const visible = points.slice(-24);
+  if (visible.length < 2) return <div className="history-empty">至少完成两次市值记录后显示变化曲线</div>;
+  const width = 760;
+  const height = 230;
+  const padX = 28;
+  const padTop = 18;
+  const padBottom = 34;
+  const values = visible.map((item) => item.marketValue);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const padding = Math.max((max - min) * 0.12, max * 0.005, 1);
+  const low = min - padding;
+  const high = max + padding;
+  const x = (index: number) => padX + index * ((width - padX * 2) / Math.max(visible.length - 1, 1));
+  const y = (value: number) => padTop + (high - value) / Math.max(high - low, 1) * (height - padTop - padBottom);
+  const path = visible.map((item, index) => `${x(index)},${y(item.marketValue)}`).join(" ");
+  return <div className="valuation-chart"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="持仓市值历史"><polyline points={path} fill="none" stroke="#2e7d55" strokeWidth="3" strokeLinejoin="round" strokeLinecap="round" />{visible.map((item, index) => <g key={item.id}><circle cx={x(index)} cy={y(item.marketValue)} r="3.5" fill="#2e7d55"><title>{item.date} · {formatMoney(item.marketValue, currency)}</title></circle>{(index === 0 || index === visible.length - 1 || index % Math.ceil(visible.length / 6) === 0) && <text x={x(index)} y={height - 9} textAnchor="middle">{item.date.slice(5)}</text>}</g>)}</svg><div className="chart-range"><span>{formatMoney(low, currency)}</span><span>{formatMoney(high, currency)}</span></div></div>;
+}
+
+function HoldingDetailModal({ detail, onClose }: { detail: HoldingDetail; onClose: () => void }) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal holding-detail-modal" role="dialog" aria-modal="true" aria-labelledby="holding-detail-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-header"><div><h2 id="holding-detail-title">{detail.name}</h2><p>{detail.code} · {detail.channel} · {detail.currency}</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
+        <section className="holding-detail-metrics"><div><span>当前市值</span><strong>{formatMoney(detail.marketValue, detail.currency)}</strong></div><div><span>持有收益</span><strong className={detail.gain >= 0 ? "gain" : "loss"}>{formatMoney(detail.gain, detail.currency)} · {formatPercent(detail.gainRate)}</strong></div><div><span>近7日估值收益</span><strong className={detail.sevenDayReturn === null ? "" : detail.sevenDayReturn >= 0 ? "gain" : "loss"}>{detail.sevenDayReturn === null ? "—" : formatPercent(detail.sevenDayReturn)}</strong></div><div><span>近30日估值收益</span><strong className={detail.thirtyDayReturn === null ? "" : detail.thirtyDayReturn >= 0 ? "gain" : "loss"}>{detail.thirtyDayReturn === null ? "—" : formatPercent(detail.thirtyDayReturn)}</strong></div></section>
+        <div className={`holding-signal signal-card-${detail.signal.toLowerCase()}`}><div><Sparkles /><strong>{detail.signalLabel}</strong></div><p>{detail.signalReason}</p></div>
+        <div className="history-section"><div className="panel-header"><h2>市值变化</h2><span>最近更新 {detail.valuationDate} · {detail.daysSinceValuation === 0 ? "今天" : `${detail.daysSinceValuation}天前`}</span></div><ValuationHistoryChart points={detail.history} currency={detail.currency} /></div>
+        <div className="history-table"><div className="batch-list-head"><span>日期</span><span>市值</span><span>估值收益</span><span>来源</span></div>{detail.history.slice().reverse().slice(0, 12).map((item) => <div key={item.id}><span>{item.date}</span><strong>{formatMoney(item.marketValue, detail.currency)}</strong><span className={item.changeRate === null ? "" : item.changeRate >= 0 ? "gain" : "loss"}>{item.changeRate === null ? "—" : `${formatMoney(item.changeAmount ?? 0, detail.currency)} · ${formatPercent(item.changeRate)}`}</span><span>{item.source}</span></div>)}</div>
+        <div className="advice-disclaimer"><AlertTriangle />这些信号是记录整理和复核提示，不是收益保证或个性化投资顾问意见。历史表现不能预测未来。</div>
+        <div className="entry-actions"><button className="button secondary" onClick={onClose}>关闭</button></div>
+      </section>
+    </div>
   );
 }
 
@@ -730,7 +856,6 @@ const entryOperations: { value: EntryOperation; label: string; help: string }[] 
   { value: "BUY", label: "买入理财", help: "自动新增批次" },
   { value: "SELL", label: "卖出理财", help: "自动 FIFO 核销" },
   { value: "PRODUCT_MATURITY", label: "理财到期", help: "全部结清" },
-  { value: "VALUATION", label: "更新市值", help: "保留历史快照" },
   { value: "DIVIDEND", label: "收到分红", help: "计入已实现收益" },
   { value: "FEE", label: "支付费用", help: "计入收益扣减" },
   { value: "TRANSFER", label: "账户转账", help: "不影响总资产" },
