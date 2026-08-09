@@ -735,17 +735,30 @@ function HoldingsView({ holdings, onBatchUpdate, onSelect, loading }: { holdings
 
 function BatchValuationModal({ holdings, onClose, onSave }: { holdings: Holding[]; onClose: () => void; onSave: (input: BatchValuationInput) => Promise<void> }) {
   const today = new Date().toISOString().slice(0, 10);
+  const sortedHoldings = useMemo(() => {
+    const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+    return [...holdings].sort((left, right) => {
+      const leftCode = left.code.trim();
+      const rightCode = right.code.trim();
+      if (!leftCode && rightCode) return 1;
+      if (leftCode && !rightCode) return -1;
+      const byCode = collator.compare(leftCode, rightCode);
+      if (byCode !== 0) return byCode;
+      const byChannel = collator.compare(left.channel, right.channel);
+      return byChannel !== 0 ? byChannel : left.accountId - right.accountId;
+    });
+  }, [holdings]);
   const [valuationDate, setValuationDate] = useState(today);
   const [note, setNote] = useState("");
-  const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(holdings.map((item) => [`${item.productId}:${item.accountId}`, item.marketValue.toString()])));
+  const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(sortedHoldings.map((item) => [`${item.productId}:${item.accountId}`, item.marketValue.toString()])));
   const [submitting, setSubmitting] = useState(false);
-  const changed = holdings.filter((item) => {
+  const changed = sortedHoldings.filter((item) => {
     const next = Number(values[`${item.productId}:${item.accountId}`]);
     return Number.isFinite(next) && Math.abs(next - item.marketValue) > 0.000001;
   }).length;
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    const items = holdings.map((item) => ({ productId: item.productId, accountId: item.accountId, marketValue: Number(values[`${item.productId}:${item.accountId}`]) }));
+    const items = sortedHoldings.map((item) => ({ productId: item.productId, accountId: item.accountId, marketValue: Number(values[`${item.productId}:${item.accountId}`]) }));
     if (items.some((item) => !Number.isFinite(item.marketValue) || item.marketValue < 0)) return;
     setSubmitting(true);
     try {
@@ -760,13 +773,13 @@ function BatchValuationModal({ holdings, onClose, onSave }: { holdings: Holding[
         <div className="modal-header"><div><h2 id="batch-title">批量更新市值</h2><p>一次完成全部持仓的周度估值；未变化的数值也会留下本次确认记录</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
         <form onSubmit={(event) => void submit(event)}>
           <div className="batch-meta"><label>估值日期<input required type="date" value={valuationDate} onChange={(event) => setValuationDate(event.target.value)} /></label><label>备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：周末统一更新" /></label></div>
-          <div className="batch-list"><div className="batch-list-head"><span>产品与渠道</span><span>原市值</span><span>本次市值</span><span>变化</span></div>{holdings.map((item) => {
+          <div className="batch-list"><div className="batch-list-head"><span>产品、代码与渠道</span><span>原市值</span><span>本次市值</span><span>变化</span></div>{sortedHoldings.map((item) => {
             const key = `${item.productId}:${item.accountId}`;
             const next = Number(values[key]);
             const difference = Number.isFinite(next) ? next - item.marketValue : 0;
-            return <div className="batch-row" key={key}><div><strong>{item.name}</strong><span>{item.channel} · {item.currency}</span></div><span>{formatMoney(item.marketValue, item.currency)}</span><input required aria-label={`${item.name}本次市值`} type="number" min="0" step="0.01" value={values[key]} onChange={(event) => setValues((current) => ({ ...current, [key]: event.target.value }))} /><b className={difference >= 0 ? "gain" : "loss"}>{difference === 0 ? "—" : `${difference > 0 ? "+" : ""}${formatMoney(difference, item.currency)}`}</b></div>;
+            return <div className="batch-row" key={key}><div><strong>{item.name}</strong><span>{item.code || "无代码"} · {item.channel} · {item.currency}</span></div><span>{formatMoney(item.marketValue, item.currency)}</span><input required aria-label={`${item.name}本次市值`} type="number" min="0" step="0.01" value={values[key]} onChange={(event) => setValues((current) => ({ ...current, [key]: event.target.value }))} /><b className={difference >= 0 ? "gain" : "loss"}>{difference === 0 ? "—" : `${difference > 0 ? "+" : ""}${formatMoney(difference, item.currency)}`}</b></div>;
           })}</div>
-          <div className="batch-footer"><div><strong>{holdings.length}</strong> 个持仓将记录本次估值，<strong>{changed}</strong> 个市值发生变化</div><div className="entry-actions"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Save />{submitting ? "保存中…" : "保存全部市值"}</button></div></div>
+          <div className="batch-footer"><div><strong>{sortedHoldings.length}</strong> 个持仓将记录本次估值，<strong>{changed}</strong> 个市值发生变化</div><div className="entry-actions"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Save />{submitting ? "保存中…" : "保存全部市值"}</button></div></div>
         </form>
       </section>
     </div>
