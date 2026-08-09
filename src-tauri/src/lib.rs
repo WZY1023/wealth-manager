@@ -232,6 +232,7 @@ struct ProductRecord {
     name: String,
     currency: String,
     issuer: Option<String>,
+    purchase_banks: Vec<String>,
     risk_level: Option<String>,
     source: String,
 }
@@ -506,6 +507,18 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           FOREIGN KEY(transaction_id) REFERENCES transactions(id)
         );
 
+        CREATE TABLE IF NOT EXISTS product_purchase_channels (
+          id INTEGER PRIMARY KEY,
+          product_id INTEGER NOT NULL,
+          account_id INTEGER NOT NULL,
+          first_purchase_date TEXT,
+          last_purchase_date TEXT,
+          source TEXT NOT NULL DEFAULT 'manual',
+          FOREIGN KEY(product_id) REFERENCES products(id),
+          FOREIGN KEY(account_id) REFERENCES accounts(id),
+          UNIQUE(product_id, account_id, source)
+        );
+
         CREATE TABLE IF NOT EXISTS valuations (
           id INTEGER PRIMARY KEY,
           product_id INTEGER NOT NULL,
@@ -681,6 +694,47 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         [],
     )?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS product_purchase_channels_product
+         ON product_purchase_channels(product_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS product_purchase_channels_account
+         ON product_purchase_channels(account_id)",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO product_purchase_channels
+           (product_id, account_id, first_purchase_date, last_purchase_date, source)
+         SELECT l.product_id, l.account_id, MIN(l.purchase_date), MAX(l.purchase_date), l.source
+         FROM position_lots l
+         JOIN products p ON p.id = l.product_id
+         JOIN accounts a ON a.id = l.account_id
+         WHERE 1
+         GROUP BY l.product_id, l.account_id, l.source
+         ON CONFLICT(product_id, account_id, source) DO UPDATE SET
+           first_purchase_date = CASE
+             WHEN product_purchase_channels.first_purchase_date IS NULL THEN excluded.first_purchase_date
+             WHEN excluded.first_purchase_date IS NULL THEN product_purchase_channels.first_purchase_date
+             ELSE MIN(product_purchase_channels.first_purchase_date, excluded.first_purchase_date)
+           END,
+           last_purchase_date = CASE
+             WHEN product_purchase_channels.last_purchase_date IS NULL THEN excluded.last_purchase_date
+             WHEN excluded.last_purchase_date IS NULL THEN product_purchase_channels.last_purchase_date
+             ELSE MAX(product_purchase_channels.last_purchase_date, excluded.last_purchase_date)
+           END",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO product_purchase_channels (product_id, account_id, source)
+         SELECT DISTINCT v.product_id, v.account_id, v.source
+         FROM valuations v
+         JOIN products p ON p.id = v.product_id
+         JOIN accounts a ON a.id = v.account_id",
+        [],
+    )?;
+    normalize_existing_product_metadata(conn)?;
+    conn.execute(
         "UPDATE transactions
          SET cost_basis = COALESCE((
                SELECT l.original_amount FROM position_lots l
@@ -710,6 +764,87 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
            AND COALESCE(cost_basis, 0) <= 0.000001",
         [],
     )?;
+    Ok(())
+}
+
+fn normalized_product_metadata(name: &str) -> (Option<String>, String) {
+    let name = name.trim();
+    let separator = ["-", "－", "—", "–", "·"]
+        .iter()
+        .filter_map(|separator| name.find(separator).map(|index| (index, separator.len())))
+        .min_by_key(|(index, _)| *index);
+    let boundary = separator.or_else(|| {
+        let end = name.find("理财").map(|index| index + "理财".len())?;
+        let prefix = name.get(..end)?.trim();
+        let remainder = name.get(end..)?.trim_start();
+        if prefix.chars().count() >= 4 && matches!(remainder.chars().next(), Some('“' | '"' | '《'))
+        {
+            Some((end, 0))
+        } else {
+            None
+        }
+    });
+    let Some((index, separator_length)) = boundary else {
+        return (None, name.to_string());
+    };
+    let issuer = name[..index].trim();
+    let product_name = name[index + separator_length..]
+        .trim_start_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '-' | '－' | '—' | '–' | '·')
+        })
+        .trim();
+    if issuer.is_empty() || product_name.is_empty() {
+        (None, name.to_string())
+    } else {
+        (Some(issuer.to_string()), product_name.to_string())
+    }
+}
+
+fn strip_known_issuer_prefix(name: &str, issuer: &str) -> Option<String> {
+    let remainder = name.trim().strip_prefix(issuer.trim())?.trim_start();
+    let first = remainder.chars().next()?;
+    let normalized = if matches!(first, '-' | '－' | '—' | '–' | '·') {
+        remainder
+            .trim_start_matches(|character: char| {
+                character.is_whitespace() || matches!(character, '-' | '－' | '—' | '–' | '·')
+            })
+            .trim()
+    } else if matches!(first, '“' | '"' | '《') {
+        remainder.trim()
+    } else {
+        return None;
+    };
+    (!normalized.is_empty()).then(|| normalized.to_string())
+}
+
+fn normalize_existing_product_metadata(conn: &Connection) -> rusqlite::Result<()> {
+    let products = {
+        let mut statement = conn.prepare("SELECT id, name, issuer FROM products ORDER BY id")?;
+        let records = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        records
+    };
+    for (id, original_name, existing_issuer) in products {
+        let existing_issuer = existing_issuer.filter(|value| !value.trim().is_empty());
+        let (issuer, normalized_name) = if let Some(issuer) = existing_issuer {
+            let normalized_name = strip_known_issuer_prefix(&original_name, &issuer)
+                .unwrap_or_else(|| original_name.trim().to_string());
+            (Some(issuer), normalized_name)
+        } else {
+            normalized_product_metadata(&original_name)
+        };
+        conn.execute(
+            "UPDATE products SET name = ?1, issuer = ?2 WHERE id = ?3",
+            params![normalized_name, issuer, id],
+        )?;
+    }
     Ok(())
 }
 
@@ -810,6 +945,7 @@ fn product_id(
     name: &str,
     currency: &str,
 ) -> rusqlite::Result<i64> {
+    let (issuer, normalized_name) = normalized_product_metadata(name);
     let existing: Option<(i64, bool)> = tx
         .query_row(
             "SELECT id, is_user_edited != 0 FROM products
@@ -822,18 +958,45 @@ fn product_id(
     if let Some((id, edited)) = existing {
         if !edited {
             tx.execute(
-                "UPDATE products SET name = ?1 WHERE id = ?2",
-                params![name, id],
+                "UPDATE products SET name = ?1, issuer = COALESCE(?2, issuer) WHERE id = ?3",
+                params![normalized_name, issuer, id],
             )?;
         }
         return Ok(id);
     }
     tx.execute(
-        "INSERT INTO products (code, name, currency, import_code, source)
-         VALUES (?1, ?2, ?3, ?1, 'excel')",
-        params![code, name, currency],
+        "INSERT INTO products (code, name, currency, issuer, import_code, source)
+         VALUES (?1, ?2, ?3, ?4, ?1, 'excel')",
+        params![code, normalized_name, currency, issuer],
     )?;
     Ok(tx.last_insert_rowid())
+}
+
+fn link_product_account(
+    tx: &Transaction<'_>,
+    product: i64,
+    account: i64,
+    purchase_date: Option<&str>,
+    source: &str,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO product_purchase_channels
+           (product_id, account_id, first_purchase_date, last_purchase_date, source)
+         VALUES (?1, ?2, ?3, ?3, ?4)
+         ON CONFLICT(product_id, account_id, source) DO UPDATE SET
+           first_purchase_date = CASE
+             WHEN product_purchase_channels.first_purchase_date IS NULL THEN excluded.first_purchase_date
+             WHEN excluded.first_purchase_date IS NULL THEN product_purchase_channels.first_purchase_date
+             ELSE MIN(product_purchase_channels.first_purchase_date, excluded.first_purchase_date)
+           END,
+           last_purchase_date = CASE
+             WHEN product_purchase_channels.last_purchase_date IS NULL THEN excluded.last_purchase_date
+             WHEN excluded.last_purchase_date IS NULL THEN product_purchase_channels.last_purchase_date
+             ELSE MAX(product_purchase_channels.last_purchase_date, excluded.last_purchase_date)
+           END",
+        params![product, account, purchase_date, source],
+    )?;
+    Ok(())
 }
 
 fn required_text(value: &Option<String>, label: &str) -> Result<String, String> {
@@ -883,10 +1046,14 @@ fn manual_product_id(
     name: &str,
     currency: &str,
 ) -> rusqlite::Result<i64> {
+    let (issuer, normalized_name) = normalized_product_metadata(name);
     tx.execute(
-        "INSERT INTO products (code, name, currency, source) VALUES (?1, ?2, ?3, 'manual')
-         ON CONFLICT(code) DO UPDATE SET name = excluded.name",
-        params![code, name, currency],
+        "INSERT INTO products (code, name, currency, issuer, source)
+         VALUES (?1, ?2, ?3, ?4, 'manual')
+         ON CONFLICT(code) DO UPDATE SET
+           name = CASE WHEN products.is_user_edited = 0 THEN excluded.name ELSE products.name END,
+           issuer = COALESCE(products.issuer, excluded.issuer)",
+        params![code, normalized_name, currency, issuer],
     )?;
     tx.query_row(
         "SELECT id FROM products WHERE code = ?1",
@@ -1343,6 +1510,8 @@ fn apply_entry(conn: &mut Connection, input: &EntryInput) -> Result<EntryResult,
                 (product, name)
             };
             let account = manual_account_id(&tx, &institution, &currency)
+                .map_err(|error| error.to_string())?;
+            link_product_account(&tx, product, account, Some(&trade_date), "manual")
                 .map_err(|error| error.to_string())?;
             let previous = current_market_value(&tx, product, account)
                 .map_err(|error| error.to_string())?
@@ -1916,6 +2085,10 @@ fn reverse_entry(conn: &mut Connection, transaction_id: i64) -> Result<EntryResu
 }
 
 fn clear_excel_data(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM product_purchase_channels WHERE source = 'excel'",
+        [],
+    )?;
     tx.execute("DELETE FROM valuations WHERE source = 'excel'", [])?;
     tx.execute("DELETE FROM position_lots WHERE source = 'excel'", [])?;
     tx.execute("DELETE FROM transactions WHERE source = 'excel'", [])?;
@@ -1941,7 +2114,8 @@ fn clear_excel_data(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         "DELETE FROM products WHERE source = 'excel' AND is_user_edited = 0
          AND id NOT IN (SELECT DISTINCT product_id FROM transactions WHERE product_id IS NOT NULL)
          AND id NOT IN (SELECT DISTINCT product_id FROM position_lots)
-         AND id NOT IN (SELECT DISTINCT product_id FROM valuations)",
+         AND id NOT IN (SELECT DISTINCT product_id FROM valuations)
+         AND id NOT IN (SELECT DISTINCT product_id FROM product_purchase_channels)",
         [],
     )?;
     tx.execute(
@@ -1950,7 +2124,8 @@ fn clear_excel_data(tx: &Transaction<'_>) -> rusqlite::Result<()> {
          AND id NOT IN (SELECT DISTINCT account_id FROM position_lots)
          AND id NOT IN (SELECT DISTINCT account_id FROM valuations)
          AND id NOT IN (SELECT DISTINCT account_id FROM deposits)
-         AND id NOT IN (SELECT DISTINCT account_id FROM account_balance_snapshots)",
+         AND id NOT IN (SELECT DISTINCT account_id FROM account_balance_snapshots)
+         AND id NOT IN (SELECT DISTINCT account_id FROM product_purchase_channels)",
         [],
     )?;
     Ok(())
@@ -2044,10 +2219,13 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
             product_id(&tx, &code, &name, &currency).map_err(|error| error.to_string())?;
         let account =
             account_id(&tx, &institution, &currency).map_err(|error| error.to_string())?;
+        let purchase_date_text = purchase_date.format("%Y-%m-%d").to_string();
+        link_product_account(&tx, product, account, Some(&purchase_date_text), "excel")
+            .map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO transactions (product_id, account_id, transaction_type, trade_date, amount, currency, note, cost_basis, source, source_row)
              VALUES (?1, ?2, 'BUY', ?3, ?4, ?5, ?6, ?4, 'excel', ?7)",
-            params![product, account, purchase_date.format("%Y-%m-%d").to_string(), amount, currency, transaction_note, source_row],
+            params![product, account, purchase_date_text, amount, currency, transaction_note, source_row],
         )
         .map_err(|error| error.to_string())?;
         tx.execute(
@@ -2056,7 +2234,7 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
             params![
                 product,
                 account,
-                purchase_date.format("%Y-%m-%d").to_string(),
+                purchase_date_text,
                 amount,
                 end_date.map(|date| date.format("%Y-%m-%d").to_string()),
                 if active { "active" } else { "closed" },
@@ -2132,6 +2310,8 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
             product_id(&tx, &code, &name, &currency).map_err(|error| error.to_string())?;
         let account =
             account_id(&tx, &institution, &currency).map_err(|error| error.to_string())?;
+        link_product_account(&tx, product, account, None, "excel")
+            .map_err(|error| error.to_string())?;
         let has_manual_current: bool = tx
             .query_row(
                 "SELECT EXISTS(
@@ -3317,7 +3497,7 @@ fn list_master_data_from_conn(conn: &Connection) -> Result<MasterData, String> {
                  ORDER BY code COLLATE NOCASE ASC, currency ASC, name COLLATE NOCASE ASC",
             )
             .map_err(|error| error.to_string())?;
-        let records = statement
+        let mut records = statement
             .query_map([], |row| {
                 Ok(ProductRecord {
                     id: row.get(0)?,
@@ -3325,6 +3505,7 @@ fn list_master_data_from_conn(conn: &Connection) -> Result<MasterData, String> {
                     name: row.get(2)?,
                     currency: row.get(3)?,
                     issuer: row.get(4)?,
+                    purchase_banks: Vec::new(),
                     risk_level: row.get(5)?,
                     source: row.get(6)?,
                 })
@@ -3332,6 +3513,22 @@ fn list_master_data_from_conn(conn: &Connection) -> Result<MasterData, String> {
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
+        let mut channel_statement = conn
+            .prepare(
+                "SELECT DISTINCT a.institution
+                 FROM product_purchase_channels c
+                 JOIN accounts a ON a.id = c.account_id
+                 WHERE c.product_id = ?1
+                 ORDER BY a.institution COLLATE NOCASE",
+            )
+            .map_err(|error| error.to_string())?;
+        for product in &mut records {
+            product.purchase_banks = channel_statement
+                .query_map([product.id], |row| row.get(0))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+        }
         records
     };
     let deposits = {
@@ -5549,6 +5746,89 @@ mod tests {
     }
 
     #[test]
+    fn product_metadata_is_split_from_common_name_separators() {
+        assert_eq!(
+            normalized_product_metadata("中银理财-稳富固收增强"),
+            (Some("中银理财".to_string()), "稳富固收增强".to_string())
+        );
+        assert_eq!(
+            normalized_product_metadata("工银理财·鑫添益365天"),
+            (Some("工银理财".to_string()), "鑫添益365天".to_string())
+        );
+        assert_eq!(
+            normalized_product_metadata("中银理财“富”固收增强"),
+            (Some("中银理财".to_string()), "“富”固收增强".to_string())
+        );
+        assert_eq!(
+            normalized_product_metadata("春系列诚享28天"),
+            (None, "春系列诚享28天".to_string())
+        );
+        assert_eq!(
+            strip_known_issuer_prefix("招银理财-招睿美元添天金稳健型-汇", "招银理财"),
+            Some("招睿美元添天金稳健型-汇".to_string())
+        );
+        assert_eq!(
+            strip_known_issuer_prefix("招睿美元添天金稳健型-汇", "招银理财"),
+            None
+        );
+    }
+
+    #[test]
+    fn migration_normalizes_products_and_backfills_purchase_channels() {
+        let conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("initial migration");
+        conn.execute(
+            "INSERT INTO products (code, name, currency, source)
+             VALUES ('LEGACY01', '中银理财-迁移测试产品', 'CNY', 'excel')",
+            [],
+        )
+        .expect("insert product");
+        let product = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO accounts (institution, name, currency, source)
+             VALUES ('中国银行', '中国银行', 'CNY', 'excel')",
+            [],
+        )
+        .expect("insert account");
+        let account = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO position_lots
+               (product_id, account_id, purchase_date, original_amount, remaining_amount, status, source)
+             VALUES (?1, ?2, '2026-01-02', 1000, 1000, 'active', 'excel')",
+            params![product, account],
+        )
+        .expect("insert legacy lot");
+
+        migrate(&conn).expect("upgrade data");
+
+        let (name, issuer): (String, Option<String>) = conn
+            .query_row(
+                "SELECT name, issuer FROM products WHERE id = ?1",
+                [product],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("normalized product");
+        assert_eq!(name, "迁移测试产品");
+        assert_eq!(issuer.as_deref(), Some("中银理财"));
+        let dates: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT first_purchase_date, last_purchase_date
+                 FROM product_purchase_channels
+                 WHERE product_id = ?1 AND account_id = ?2 AND source = 'excel'",
+                params![product, account],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("backfilled purchase channel");
+        assert_eq!(
+            dates,
+            (
+                Some("2026-01-02".to_string()),
+                Some("2026-01-02".to_string())
+            )
+        );
+    }
+
+    #[test]
     fn imports_reference_workbook() {
         let workbook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../理财.xlsx");
         let mut conn = Connection::open_in_memory().expect("open memory db");
@@ -5571,6 +5851,29 @@ mod tests {
             })
             .expect("valuation date");
         assert_eq!(valuation_date, Local::now().format("%Y-%m-%d").to_string());
+        let (name, issuer, bank): (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT p.name, p.issuer, a.institution
+                 FROM products p
+                 JOIN product_purchase_channels c ON c.product_id = p.id
+                 JOIN accounts a ON a.id = c.account_id
+                 WHERE p.code = '8300ZD'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("normalized product metadata");
+        assert_eq!(name, "招赢天天鑫B");
+        assert_eq!(issuer.as_deref(), Some("招银理财"));
+        assert_eq!(bank, "中国银行");
+        migrate(&conn).expect("repeat migration");
+        let name_after_restart: String = conn
+            .query_row(
+                "SELECT name FROM products WHERE code = '6932D'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("idempotent normalized name");
+        assert_eq!(name_after_restart, "招睿美元添天金稳健型-汇");
     }
 
     #[test]
@@ -5591,6 +5894,36 @@ mod tests {
             .map(|product| product.code)
             .collect::<Vec<_>>();
         assert_eq!(codes, vec!["A100", "M200", "Z300"]);
+    }
+
+    #[test]
+    fn one_product_can_keep_multiple_purchase_banks() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        let mut first = entry("BUY", 10_000.0);
+        first.product_name = Some("测试发行机构-多渠道产品".to_string());
+        apply_entry(&mut conn, &first).expect("first bank purchase");
+        let product: i64 = conn
+            .query_row(
+                "SELECT id FROM products WHERE code = 'TEST001'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("product id");
+        let mut second = entry("BUY", 5_000.0);
+        second.product_id = Some(product);
+        second.institution = Some("另一家银行".to_string());
+        apply_entry(&mut conn, &second).expect("second bank purchase");
+
+        let product = list_master_data_from_conn(&conn)
+            .expect("master data")
+            .products
+            .into_iter()
+            .find(|item| item.code == "TEST001")
+            .expect("product metadata");
+        assert_eq!(product.name, "多渠道产品");
+        assert_eq!(product.issuer.as_deref(), Some("测试发行机构"));
+        assert_eq!(product.purchase_banks, vec!["另一家银行", "测试银行"]);
     }
 
     fn entry(operation: &str, amount: f64) -> EntryInput {
