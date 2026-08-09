@@ -3313,7 +3313,8 @@ fn list_master_data_from_conn(conn: &Connection) -> Result<MasterData, String> {
         let mut statement = conn
             .prepare(
                 "SELECT id, code, name, currency, issuer, risk_level, source
-                 FROM products ORDER BY currency, name, code",
+                 FROM products
+                 ORDER BY code COLLATE NOCASE ASC, currency ASC, name COLLATE NOCASE ASC",
             )
             .map_err(|error| error.to_string())?;
         let records = statement
@@ -5570,6 +5571,26 @@ mod tests {
             })
             .expect("valuation date");
         assert_eq!(valuation_date, Local::now().format("%Y-%m-%d").to_string());
+    }
+
+    #[test]
+    fn master_data_products_are_sorted_by_code_ascending() {
+        let conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        conn.execute_batch(
+            "INSERT INTO products (code, name, currency, source) VALUES
+               ('Z300', '第三个产品', 'CNY', 'manual'),
+               ('A100', '第一个产品', 'CNY', 'manual'),
+               ('M200', '第二个产品', 'USD', 'manual');",
+        )
+        .expect("insert products");
+        let data = list_master_data_from_conn(&conn).expect("list master data");
+        let codes = data
+            .products
+            .into_iter()
+            .map(|product| product.code)
+            .collect::<Vec<_>>();
+        assert_eq!(codes, vec!["A100", "M200", "Z300"]);
     }
 
     fn entry(operation: &str, amount: f64) -> EntryInput {
