@@ -100,11 +100,14 @@ type TransactionDetail = TransactionRecord & {
   institution: string | null;
   valuationBefore: number | null;
   valuationAfter: number | null;
+  canEdit: boolean;
+  editHint: string | null;
   canConfirmHistoricalRedemption: boolean;
   needsReview: boolean;
 };
 
 type HistoricalRedemptionInput = { transactionId: number; tradeDate: string; proceeds: number; note: string | null };
+type TransactionEditInput = { transactionId: number; tradeDate: string; amount: number; note: string | null };
 
 type EntryInput = {
   operation: EntryOperation;
@@ -232,6 +235,7 @@ function App() {
   const [batchValuationOpen, setBatchValuationOpen] = useState(false);
   const [dataOpen, setDataOpen] = useState(false);
   const [transactionDetail, setTransactionDetail] = useState<TransactionDetail | null>(null);
+  const [transactionToEdit, setTransactionToEdit] = useState<TransactionDetail | null>(null);
   const [redemptionToConfirm, setRedemptionToConfirm] = useState<TransactionDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [editingRecord, setEditingRecord] = useState<EditableRecord | null>(null);
@@ -483,6 +487,21 @@ function App() {
     }
   };
 
+  const saveTransactionEdit = async (input: TransactionEditInput) => {
+    setError(null);
+    setLoading(true);
+    try {
+      const result = await invoke<EntryResult>("edit_transaction", { input });
+      setNotice(`${result.message}${result.realizedGain === null ? "" : `，已实现收益 ${formatMoney(result.realizedGain, transactionToEdit?.currency ?? "CNY")}`}`);
+      setTransactionToEdit(null);
+      await refresh();
+    } catch (reason) {
+      setError(String(reason));
+      setLoading(false);
+      throw reason;
+    }
+  };
+
   const openQualityIssue = (issue: QualityIssue) => {
     setView(issue.targetView);
     if (issue.targetView === "transactions" && issue.targetId !== null) void openTransaction(issue.targetId);
@@ -592,8 +611,12 @@ function App() {
           detail={transactionDetail}
           onClose={() => setTransactionDetail(null)}
           onReverse={(id) => void reverseTransaction(id)}
+          onEdit={(detail) => { setTransactionDetail(null); setTransactionToEdit(detail); }}
           onConfirm={(detail) => { setTransactionDetail(null); setRedemptionToConfirm(detail); }}
         />
+      )}
+      {transactionToEdit && (
+        <TransactionEditModal detail={transactionToEdit} onClose={() => setTransactionToEdit(null)} onSave={saveTransactionEdit} />
       )}
       {redemptionToConfirm && (
         <HistoricalRedemptionModal detail={redemptionToConfirm} onClose={() => setRedemptionToConfirm(null)} onSave={saveHistoricalRedemption} />
@@ -980,10 +1003,11 @@ function DataSafetyModal({ busy, onClose, onExport, onBackup, onRestore }: {
   );
 }
 
-function TransactionDetailModal({ detail, onClose, onReverse, onConfirm }: {
+function TransactionDetailModal({ detail, onClose, onReverse, onEdit, onConfirm }: {
   detail: TransactionDetail;
   onClose: () => void;
   onReverse: (id: number) => void;
+  onEdit: (detail: TransactionDetail) => void;
   onConfirm: (detail: TransactionDetail) => void;
 }) {
   const status = detail.reversedBy !== null ? `已由交易 #${detail.reversedBy} 冲销` : detail.reversalOf !== null ? `冲销交易 #${detail.reversalOf}` : "有效";
@@ -1004,8 +1028,52 @@ function TransactionDetailModal({ detail, onClose, onReverse, onConfirm }: {
           <div className="detail-note"><dt>备注</dt><dd>{detail.note ?? "—"}</dd></div>
         </dl>
         {detail.needsReview && <div className="calculation-note warning-note"><AlertTriangle />这笔流水根据 Excel 中的结束日期自动生成，目前到账金额只是按原买入金额占位。请根据银行流水核对实际日期和到账金额。</div>}
-        {!detail.canReverse && detail.source === "manual" && detail.operation !== "REVERSAL" && detail.reversedBy === null && <div className="calculation-note">该产品或存款存在更新的操作。需要从最新一笔开始依次撤销，才能保证批次成本和市值连续。</div>}
-        <div className="entry-actions"><button className="button secondary" onClick={onClose}>关闭</button>{detail.canConfirmHistoricalRedemption && <button className="button primary" onClick={() => onConfirm(detail)}><CheckCircle2 />{detail.needsReview ? "核对赎回" : "修改核对"}</button>}{detail.canReverse && <button className="button danger" onClick={() => onReverse(detail.id)}><RotateCcw />安全撤销</button>}</div>
+        {!detail.canEdit && detail.editHint && !detail.canConfirmHistoricalRedemption && detail.operation !== "REVERSAL" && detail.reversedBy === null && <div className="calculation-note">{detail.editHint}</div>}
+        <div className="entry-actions"><button className="button secondary" onClick={onClose}>关闭</button>{detail.canEdit && <button className="button primary" onClick={() => onEdit(detail)}><Pencil />修改记录</button>}{detail.canConfirmHistoricalRedemption && <button className="button primary" onClick={() => onConfirm(detail)}><CheckCircle2 />{detail.needsReview ? "核对赎回" : "修改核对"}</button>}{detail.canReverse && <button className="button danger" onClick={() => onReverse(detail.id)}><RotateCcw />安全撤销</button>}</div>
+      </section>
+    </div>
+  );
+}
+
+function TransactionEditModal({ detail, onClose, onSave }: { detail: TransactionDetail; onClose: () => void; onSave: (input: TransactionEditInput) => Promise<void> }) {
+  const [tradeDate, setTradeDate] = useState(detail.tradeDate);
+  const [amount, setAmount] = useState(detail.amount.toString());
+  const [note, setNote] = useState(detail.note ?? "");
+  const [submitting, setSubmitting] = useState(false);
+  const parsedAmount = amount.trim() === "" ? null : Number(amount);
+  const amountLabel: Record<string, string> = {
+    BUY: "买入金额",
+    SELL: "实际到账金额",
+    PRODUCT_MATURITY: "实际到账金额",
+    VALUATION: "当前总市值",
+    DIVIDEND: "分红金额",
+    FEE: "费用金额",
+    TRANSFER: "转账金额",
+    DEPOSIT_OPEN: "存款本金",
+    DEPOSIT_MATURITY: "实际到账金额",
+  };
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (parsedAmount === null || !Number.isFinite(parsedAmount) || parsedAmount <= 0) return;
+    setSubmitting(true);
+    try {
+      await onSave({ transactionId: detail.id, tradeDate, amount: parsedAmount, note: note.trim() || null });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal redemption-modal" role="dialog" aria-modal="true" aria-labelledby="transaction-edit-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-header"><div><h2 id="transaction-edit-title">修改交易记录</h2><p>{detail.title}{detail.code ? ` · ${detail.code}` : ""}</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
+        <div className="redemption-context"><div><span>操作类型</span><strong>{operationLabels[detail.operation] ?? detail.operation}</strong></div><div><span>银行/渠道</span><strong>{detail.institution ?? "—"}</strong></div><div><span>币种</span><strong>{detail.currency}</strong></div></div>
+        <form className="entry-form redemption-form" onSubmit={(event) => void submit(event)}>
+          <label>操作日期<input required type="date" value={tradeDate} onChange={(event) => setTradeDate(event.target.value)} /></label>
+          <label>{amountLabel[detail.operation] ?? "金额"}<input required autoFocus type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} /></label>
+          <label className="full-field">备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="补充银行流水、用途或核对说明" /></label>
+          <div className="calculation-note full-field">操作类型、产品、银行和币种保持不变；保存后会自动重算 FIFO 成本、持仓市值与收益。{detail.source === "excel" ? "这条 Excel 修正会在以后重新导入时继续沿用。" : "修改前会自动备份数据库，并保留审计记录。"}</div>
+          <div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Save />{submitting ? "保存中…" : "保存修改"}</button></div>
+        </form>
       </section>
     </div>
   );

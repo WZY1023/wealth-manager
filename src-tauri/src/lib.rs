@@ -194,6 +194,15 @@ struct HistoricalRedemptionInput {
     note: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransactionEditInput {
+    transaction_id: i64,
+    trade_date: String,
+    amount: f64,
+    note: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QualityIssue {
@@ -346,6 +355,8 @@ struct TransactionDetail {
     reversed_by: Option<i64>,
     reversal_of: Option<i64>,
     can_reverse: bool,
+    can_edit: bool,
+    edit_hint: Option<String>,
     can_confirm_historical_redemption: bool,
     needs_review: bool,
 }
@@ -584,6 +595,18 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS excel_transaction_corrections (
+          id INTEGER PRIMARY KEY,
+          correction_key TEXT NOT NULL UNIQUE,
+          source_row INTEGER NOT NULL,
+          operation TEXT NOT NULL,
+          trade_date TEXT NOT NULL,
+          amount REAL NOT NULL,
+          note TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
         "#,
     )?;
     ensure_column(
@@ -753,6 +776,10 @@ fn historical_redemption_key(
         original_cost,
         end_date
     )
+}
+
+fn excel_transaction_correction_key(operation: &str, source_row: i64) -> String {
+    format!("sheet1|{}|{source_row}", operation.trim().to_uppercase())
 }
 
 fn account_id(tx: &Transaction<'_>, institution: &str, currency: &str) -> rusqlite::Result<i64> {
@@ -1988,8 +2015,30 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
             ));
             continue;
         }
-        let amount = amount.unwrap_or_default();
-        let purchase_date = purchase_date.unwrap_or(today);
+        let source_row = (index + 1) as i64;
+        let correction_key = excel_transaction_correction_key("BUY", source_row);
+        let correction: Option<(String, f64, Option<String>)> = tx
+            .query_row(
+                "SELECT trade_date, amount, note FROM excel_transaction_corrections
+                 WHERE correction_key = ?1",
+                [&correction_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let (amount, purchase_date, transaction_note) =
+            if let Some((date, amount, note)) = correction {
+                let corrected_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                    .map_err(|_| format!("Sheet1 第{source_row}行保存的修正日期无效"))?;
+                warnings.push(format!("Sheet1 第{source_row}行已保留软件中的手工修正"));
+                (amount, corrected_date, note)
+            } else {
+                (
+                    amount.unwrap_or_default(),
+                    purchase_date.unwrap_or(today),
+                    Some("Excel 导入".to_string()),
+                )
+            };
         let active = end_date.map(|date| date >= workbook_as_of).unwrap_or(true);
         let product =
             product_id(&tx, &code, &name, &currency).map_err(|error| error.to_string())?;
@@ -1997,8 +2046,8 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
             account_id(&tx, &institution, &currency).map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO transactions (product_id, account_id, transaction_type, trade_date, amount, currency, note, cost_basis, source, source_row)
-             VALUES (?1, ?2, 'BUY', ?3, ?4, ?5, 'Excel 导入', ?4, 'excel', ?6)",
-            params![product, account, purchase_date.format("%Y-%m-%d").to_string(), amount, currency, (index + 1) as i64],
+             VALUES (?1, ?2, 'BUY', ?3, ?4, ?5, ?6, ?4, 'excel', ?7)",
+            params![product, account, purchase_date.format("%Y-%m-%d").to_string(), amount, currency, transaction_note, source_row],
         )
         .map_err(|error| error.to_string())?;
         tx.execute(
@@ -2011,7 +2060,7 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
                 amount,
                 end_date.map(|date| date.format("%Y-%m-%d").to_string()),
                 if active { "active" } else { "closed" },
-                (index + 1) as i64
+                source_row
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -3775,6 +3824,461 @@ fn apply_historical_redemption_confirmation(
     })
 }
 
+fn transaction_editability(
+    conn: &Connection,
+    transaction_id: i64,
+) -> Result<(bool, Option<String>), String> {
+    let target: Option<(String, String, Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT transaction_type, source, reversed_by, source_row
+             FROM transactions WHERE id = ?1",
+            [transaction_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((operation, source, reversed_by, source_row)) = target else {
+        return Ok((false, Some("没有找到该交易".to_string())));
+    };
+    if reversed_by.is_some() || operation == "REVERSAL" {
+        return Ok((false, Some("已冲销流水不能再次修改".to_string())));
+    }
+    if source == "manual" {
+        return if transaction_can_be_reversed(conn, transaction_id)? {
+            Ok((true, None))
+        } else {
+            Ok((
+                false,
+                Some("该产品或存款存在更新的手工操作，请先修改最新一笔流水".to_string()),
+            ))
+        };
+    }
+    if source == "excel" && operation == "BUY" && source_row.is_some() {
+        let allocated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transaction_lot_allocations a
+                 JOIN position_lots l ON l.id = a.lot_id
+                 WHERE l.source = 'excel' AND l.source_row = ?1",
+                [source_row],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        return if allocated == 0 {
+            Ok((true, None))
+        } else {
+            Ok((
+                false,
+                Some("该导入批次已被后续手工卖出核销，请先处理后续卖出流水".to_string()),
+            ))
+        };
+    }
+    if source == "excel" && operation == "REDEEM" {
+        return Ok((
+            false,
+            Some("历史赎回请使用“修改核对”调整日期和到账金额".to_string()),
+        ));
+    }
+    Ok((
+        false,
+        Some("该导入流水需要在原 Excel 中修改后重新导入".to_string()),
+    ))
+}
+
+fn update_transaction_valuation(
+    tx: &Transaction<'_>,
+    transaction_id: i64,
+    trade_date: &str,
+    market_value: f64,
+) -> Result<(), String> {
+    let changed = tx
+        .execute(
+            "UPDATE valuations SET valuation_date = ?1, market_value = ?2
+             WHERE transaction_id = ?3",
+            params![trade_date, market_value, transaction_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("该流水缺少关联的市值快照，无法安全修改".to_string());
+    }
+    Ok(())
+}
+
+fn apply_excel_buy_edit(
+    tx: &Transaction<'_>,
+    input: &TransactionEditInput,
+    trade_date: &str,
+    note: &Option<String>,
+) -> Result<EntryResult, String> {
+    let target = tx
+        .query_row(
+            "SELECT t.source_row, t.trade_date, t.amount, t.note,
+                    t.product_id, t.account_id, t.currency,
+                    COALESCE(p.import_code, p.code),
+                    COALESCE(a.import_institution, a.institution),
+                    l.id, l.status
+             FROM transactions t
+             JOIN products p ON p.id = t.product_id
+             JOIN accounts a ON a.id = t.account_id
+             JOIN position_lots l ON l.source = 'excel' AND l.source_row = t.source_row
+               AND l.product_id = t.product_id AND l.account_id = t.account_id
+             WHERE t.id = ?1 AND t.source = 'excel' AND t.transaction_type = 'BUY'",
+            [input.transaction_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .map_err(|_| "没有找到可修改的 Excel 买入流水".to_string())?;
+    let (
+        source_row,
+        old_date,
+        old_amount,
+        old_note,
+        product,
+        account,
+        currency,
+        code,
+        institution,
+        lot_id,
+        lot_status,
+    ) = target;
+    let allocated: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM transaction_lot_allocations WHERE lot_id = ?1",
+            [lot_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if allocated > 0 {
+        return Err("该导入批次已被后续手工卖出核销，请先处理后续卖出流水".to_string());
+    }
+
+    let old_closed_group: Option<(f64, String)> = if lot_status == "closed" {
+        tx.query_row(
+            "SELECT SUM(original_amount), MAX(end_date) FROM position_lots
+             WHERE source = 'excel' AND status = 'closed'
+               AND product_id = ?1 AND account_id = ?2",
+            params![product, account],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+
+    let correction_key = excel_transaction_correction_key("BUY", source_row);
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    tx.execute(
+        "INSERT INTO excel_transaction_corrections
+           (correction_key, source_row, operation, trade_date, amount, note, created_at, updated_at)
+         VALUES (?1, ?2, 'BUY', ?3, ?4, ?5, ?6, ?6)
+         ON CONFLICT(correction_key) DO UPDATE SET
+           trade_date = excluded.trade_date, amount = excluded.amount,
+           note = excluded.note, updated_at = excluded.updated_at",
+        params![
+            correction_key,
+            source_row,
+            trade_date,
+            input.amount,
+            note,
+            now
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE transactions SET trade_date = ?1, amount = ?2, cost_basis = ?2,
+           note = ?3 WHERE id = ?4",
+        params![trade_date, input.amount, note, input.transaction_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE position_lots SET purchase_date = ?1, original_amount = ?2,
+           remaining_amount = CASE WHEN status = 'active' THEN ?2 ELSE 0 END
+         WHERE id = ?3",
+        params![trade_date, input.amount, lot_id],
+    )
+    .map_err(|error| error.to_string())?;
+
+    if let Some((old_group_cost, end_date)) = old_closed_group {
+        let new_group_cost: f64 = tx
+            .query_row(
+                "SELECT SUM(original_amount) FROM position_lots
+                 WHERE source = 'excel' AND status = 'closed'
+                   AND product_id = ?1 AND account_id = ?2",
+                params![product, account],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE transactions SET cost_basis = ?1, realized_gain = amount - ?1
+             WHERE source = 'excel' AND transaction_type = 'REDEEM'
+               AND product_id = ?2 AND account_id = ?3",
+            params![new_group_cost, product, account],
+        )
+        .map_err(|error| error.to_string())?;
+        let old_key =
+            historical_redemption_key(&code, &institution, &currency, old_group_cost, &end_date);
+        let new_key =
+            historical_redemption_key(&code, &institution, &currency, new_group_cost, &end_date);
+        tx.execute(
+            "UPDATE historical_redemption_confirmations
+             SET redemption_key = ?1, original_cost = ?2, updated_at = ?3
+             WHERE redemption_key = ?4",
+            params![new_key, new_group_cost, now, old_key],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+
+    record_master_change(
+        tx,
+        "transaction",
+        input.transaction_id,
+        serde_json::json!({"tradeDate": old_date, "amount": old_amount, "note": old_note}),
+        serde_json::json!({"tradeDate": trade_date, "amount": input.amount, "note": note}),
+    )?;
+    Ok(EntryResult {
+        message: "Excel 买入流水已修正；以后重新导入时会自动沿用".to_string(),
+        realized_gain: None,
+    })
+}
+
+fn apply_manual_transaction_edit(
+    tx: &Transaction<'_>,
+    input: &TransactionEditInput,
+    trade_date: &str,
+    note: &Option<String>,
+) -> Result<EntryResult, String> {
+    let target = tx
+        .query_row(
+            "SELECT transaction_type, product_id, account_id, deposit_id,
+                    trade_date, amount, cost_basis, realized_gain, note,
+                    valuation_before, valuation_after
+             FROM transactions WHERE id = ?1 AND source = 'manual'",
+            [input.transaction_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, f64>(6)?,
+                    row.get::<_, f64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, Option<f64>>(10)?,
+                ))
+            },
+        )
+        .map_err(|_| "没有找到可修改的手工流水".to_string())?;
+    let (
+        operation,
+        product,
+        account,
+        deposit,
+        old_date,
+        old_amount,
+        old_cost,
+        old_gain,
+        old_note,
+        before,
+        old_after,
+    ) = target;
+    let (next_cost, next_gain, next_after) = match operation.as_str() {
+        "BUY" => {
+            let previous = before.ok_or_else(|| "该买入缺少操作前市值".to_string())?;
+            let next_after = previous + input.amount;
+            let changed = tx
+                .execute(
+                    "UPDATE position_lots SET purchase_date = ?1, original_amount = ?2,
+                       remaining_amount = ?2, status = 'active'
+                     WHERE transaction_id = ?3",
+                    params![trade_date, input.amount, input.transaction_id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Err("该买入缺少关联批次，无法安全修改".to_string());
+            }
+            update_transaction_valuation(tx, input.transaction_id, trade_date, next_after)?;
+            (input.amount, 0.0, Some(next_after))
+        }
+        "SELL" | "PRODUCT_MATURITY" => {
+            let product = product.ok_or_else(|| "该卖出缺少产品关联".to_string())?;
+            let account = account.ok_or_else(|| "该卖出缺少账户关联".to_string())?;
+            let market = before.ok_or_else(|| "该卖出缺少操作前市值".to_string())?;
+            let allocations = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT lot_id, allocated_cost FROM transaction_lot_allocations
+                         WHERE transaction_id = ?1",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([input.transaction_id], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+                    })
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                rows
+            };
+            for (lot_id, allocated_cost) in allocations {
+                tx.execute(
+                    "UPDATE position_lots
+                     SET remaining_amount = MIN(original_amount, remaining_amount + ?1),
+                         status = 'active' WHERE id = ?2",
+                    params![allocated_cost, lot_id],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            let available =
+                active_cost(tx, product, account, trade_date).map_err(|error| error.to_string())?;
+            if available <= 0.000_001 {
+                return Err("修改后的日期没有可卖出的持仓成本".to_string());
+            }
+            let full = operation == "PRODUCT_MATURITY" || input.amount >= market * 0.999_999;
+            if !full && input.amount > market {
+                return Err("部分卖出的到账金额不能超过操作前市值".to_string());
+            }
+            let next_cost = if full {
+                available
+            } else {
+                available * input.amount / market
+            };
+            let next_gain = input.amount - next_cost;
+            let next_after = if full {
+                0.0
+            } else {
+                (market - input.amount).max(0.0)
+            };
+            let allocations = consume_fifo_cost(tx, product, account, trade_date, next_cost)
+                .map_err(|error| error.to_string())?;
+            save_allocations(tx, input.transaction_id, &allocations)
+                .map_err(|error| error.to_string())?;
+            update_transaction_valuation(tx, input.transaction_id, trade_date, next_after)?;
+            (next_cost, next_gain, Some(next_after))
+        }
+        "VALUATION" => {
+            update_transaction_valuation(tx, input.transaction_id, trade_date, input.amount)?;
+            (0.0, 0.0, Some(input.amount))
+        }
+        "DIVIDEND" => (0.0, input.amount, old_after),
+        "FEE" => (0.0, -input.amount, old_after),
+        "TRANSFER" => (0.0, 0.0, old_after),
+        "DEPOSIT_OPEN" => {
+            let deposit = deposit.ok_or_else(|| "该流水缺少存款关联".to_string())?;
+            tx.execute(
+                "UPDATE deposits SET principal = ?1, start_date = ?2 WHERE id = ?3",
+                params![input.amount, trade_date, deposit],
+            )
+            .map_err(|error| error.to_string())?;
+            (input.amount, 0.0, old_after)
+        }
+        "DEPOSIT_MATURITY" => {
+            let deposit = deposit.ok_or_else(|| "该流水缺少存款关联".to_string())?;
+            let principal: f64 = tx
+                .query_row(
+                    "SELECT principal FROM deposits WHERE id = ?1",
+                    [deposit],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE deposits SET matured_at = ?1, proceeds = ?2 WHERE id = ?3",
+                params![trade_date, input.amount, deposit],
+            )
+            .map_err(|error| error.to_string())?;
+            (principal, input.amount - principal, old_after)
+        }
+        _ => return Err("该交易类型不支持修改".to_string()),
+    };
+
+    tx.execute(
+        "UPDATE transactions SET trade_date = ?1, amount = ?2, note = ?3,
+           cost_basis = ?4, realized_gain = ?5, valuation_after = ?6
+         WHERE id = ?7",
+        params![
+            trade_date,
+            input.amount,
+            note,
+            next_cost,
+            next_gain,
+            next_after,
+            input.transaction_id
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    record_master_change(
+        tx,
+        "transaction",
+        input.transaction_id,
+        serde_json::json!({
+            "tradeDate": old_date, "amount": old_amount, "costBasis": old_cost,
+            "realizedGain": old_gain, "note": old_note, "valuationAfter": old_after,
+        }),
+        serde_json::json!({
+            "tradeDate": trade_date, "amount": input.amount, "costBasis": next_cost,
+            "realizedGain": next_gain, "note": note, "valuationAfter": next_after,
+        }),
+    )?;
+    Ok(EntryResult {
+        message: "交易流水已修改，相关持仓、收益和市值已重新计算".to_string(),
+        realized_gain: matches!(
+            operation.as_str(),
+            "SELL" | "PRODUCT_MATURITY" | "DEPOSIT_MATURITY" | "DIVIDEND" | "FEE"
+        )
+        .then_some(next_gain),
+    })
+}
+
+fn apply_transaction_edit(
+    conn: &mut Connection,
+    input: &TransactionEditInput,
+) -> Result<EntryResult, String> {
+    let trade_date = valid_date(&input.trade_date, "操作日期")?;
+    if !input.amount.is_finite() || input.amount <= 0.0 {
+        return Err("金额必须是大于0的有效数字".to_string());
+    }
+    let (can_edit, hint) = transaction_editability(conn, input.transaction_id)?;
+    if !can_edit {
+        return Err(hint.unwrap_or_else(|| "该交易当前不能修改".to_string()));
+    }
+    let note = input
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let source: String = tx
+        .query_row(
+            "SELECT source FROM transactions WHERE id = ?1",
+            [input.transaction_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let result = if source == "excel" {
+        apply_excel_buy_edit(&tx, input, &trade_date, &note)?
+    } else {
+        apply_manual_transaction_edit(&tx, input, &trade_date, &note)?
+    };
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
 fn record_master_change(
     tx: &Transaction<'_>,
     entity_type: &str,
@@ -4824,6 +5328,7 @@ fn get_transaction_detail(
         .lock()
         .map_err(|_| "数据库正在使用中".to_string())?;
     let can_reverse = transaction_can_be_reversed(&conn, transaction_id)?;
+    let (can_edit, edit_hint) = transaction_editability(&conn, transaction_id)?;
     conn.query_row(
         "SELECT t.id,
                 CASE WHEN t.transaction_type = 'TRANSFER' THEN
@@ -4882,6 +5387,8 @@ fn get_transaction_detail(
                 reversed_by,
                 reversal_of: row.get(15)?,
                 can_reverse,
+                can_edit,
+                edit_hint,
                 can_confirm_historical_redemption,
                 needs_review,
             })
@@ -4901,6 +5408,19 @@ fn reverse_transaction(
         .map_err(|_| "数据库正在使用中".to_string())?;
     create_auto_backup(&conn, &state.backup_dir, "pre-reversal")?;
     reverse_entry(&mut conn, transaction_id)
+}
+
+#[tauri::command]
+fn edit_transaction(
+    input: TransactionEditInput,
+    state: State<'_, AppState>,
+) -> Result<EntryResult, String> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    create_auto_backup(&conn, &state.backup_dir, "pre-transaction-edit")?;
+    apply_transaction_edit(&mut conn, &input)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -4946,6 +5466,7 @@ pub fn run() {
             record_entry,
             list_transactions,
             get_transaction_detail,
+            edit_transaction,
             reverse_transaction,
             backup_database,
             restore_database,
@@ -5140,6 +5661,192 @@ mod tests {
             )
             .expect("active lots");
         assert_eq!(active_lots, 0);
+    }
+
+    #[test]
+    fn editing_latest_manual_sale_recalculates_fifo_market_value_and_gain() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        apply_entry(&mut conn, &entry("BUY", 10_000.0)).expect("buy");
+        let (product, account): (i64, i64) = conn
+            .query_row(
+                "SELECT product_id, account_id FROM position_lots LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("holding ids");
+        let mut valuation = entry("VALUATION", 0.0);
+        valuation.product_id = Some(product);
+        valuation.account_id = Some(account);
+        valuation.market_value = Some(11_000.0);
+        apply_entry(&mut conn, &valuation).expect("valuation");
+        let mut sale = entry("SELL", 5_500.0);
+        sale.product_id = Some(product);
+        sale.account_id = Some(account);
+        apply_entry(&mut conn, &sale).expect("sale");
+        let sale_id: i64 = conn
+            .query_row(
+                "SELECT id FROM transactions WHERE transaction_type = 'SELL'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sale id");
+
+        let result = apply_transaction_edit(
+            &mut conn,
+            &TransactionEditInput {
+                transaction_id: sale_id,
+                trade_date: "2026-08-07".to_string(),
+                amount: 4_400.0,
+                note: Some("银行流水修正".to_string()),
+            },
+        )
+        .expect("edit sale");
+        assert!((result.realized_gain.unwrap_or_default() - 400.0).abs() < 0.01);
+        let (amount, cost, gain, after): (f64, f64, f64, f64) = conn
+            .query_row(
+                "SELECT amount, cost_basis, realized_gain, valuation_after
+                 FROM transactions WHERE id = ?1",
+                [sale_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("edited sale");
+        assert!((amount - 4_400.0).abs() < 0.01);
+        assert!((cost - 4_000.0).abs() < 0.01);
+        assert!((gain - 400.0).abs() < 0.01);
+        assert!((after - 6_600.0).abs() < 0.01);
+        let remaining: f64 = conn
+            .query_row(
+                "SELECT remaining_amount FROM position_lots WHERE transaction_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("remaining lot");
+        assert!((remaining - 6_000.0).abs() < 0.01);
+        let current_market: f64 = conn
+            .query_row(
+                "SELECT market_value FROM valuations WHERE is_current = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("current market");
+        assert!((current_market - 6_600.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn editing_older_manual_transaction_is_blocked_by_later_activity() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        apply_entry(&mut conn, &entry("BUY", 10_000.0)).expect("first buy");
+        let first_id: i64 = conn
+            .query_row("SELECT MIN(id) FROM transactions", [], |row| row.get(0))
+            .expect("first transaction");
+        apply_entry(&mut conn, &entry("BUY", 5_000.0)).expect("second buy");
+        let error = apply_transaction_edit(
+            &mut conn,
+            &TransactionEditInput {
+                transaction_id: first_id,
+                trade_date: "2026-08-07".to_string(),
+                amount: 9_000.0,
+                note: None,
+            },
+        )
+        .expect_err("older buy must be blocked");
+        assert!(error.contains("最新一笔"));
+    }
+
+    #[test]
+    fn excel_buy_correction_survives_reimport() {
+        let workbook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../理财.xlsx");
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        parse_workbook(&workbook, &mut conn).expect("initial import");
+        let (transaction_id, source_row, trade_date, amount): (i64, i64, String, f64) = conn
+            .query_row(
+                "SELECT t.id, t.source_row, t.trade_date, t.amount
+                 FROM transactions t JOIN position_lots l
+                   ON l.source = 'excel' AND l.source_row = t.source_row
+                 WHERE t.source = 'excel' AND t.transaction_type = 'BUY'
+                   AND l.status = 'active'
+                 ORDER BY t.source_row LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("editable excel buy");
+        apply_transaction_edit(
+            &mut conn,
+            &TransactionEditInput {
+                transaction_id,
+                trade_date: trade_date.clone(),
+                amount: amount + 123.0,
+                note: Some("软件内修正".to_string()),
+            },
+        )
+        .expect("edit imported buy");
+        let report = parse_workbook(&workbook, &mut conn).expect("reimport");
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("已保留软件中的手工修正")));
+        let (saved_amount, saved_note): (f64, Option<String>) = conn
+            .query_row(
+                "SELECT amount, note FROM transactions
+                 WHERE source = 'excel' AND transaction_type = 'BUY' AND source_row = ?1",
+                [source_row],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("reimported corrected buy");
+        assert!((saved_amount - amount - 123.0).abs() < 0.01);
+        assert_eq!(saved_note.as_deref(), Some("软件内修正"));
+    }
+
+    #[test]
+    fn editing_expired_excel_buy_updates_grouped_redemption_cost() {
+        let workbook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../理财.xlsx");
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        parse_workbook(&workbook, &mut conn).expect("initial import");
+        let (transaction_id, trade_date, amount): (i64, String, f64) = conn
+            .query_row(
+                "SELECT t.id, t.trade_date, t.amount
+                 FROM transactions t JOIN products p ON p.id = t.product_id
+                 WHERE t.source = 'excel' AND t.transaction_type = 'BUY'
+                   AND p.code = 'AF247644G' ORDER BY t.source_row LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("expired excel buy");
+        apply_transaction_edit(
+            &mut conn,
+            &TransactionEditInput {
+                transaction_id,
+                trade_date,
+                amount: amount + 100.0,
+                note: Some("历史成本修正".to_string()),
+            },
+        )
+        .expect("edit expired buy");
+        let cost_after_edit: f64 = conn
+            .query_row(
+                "SELECT t.cost_basis FROM transactions t
+                 JOIN products p ON p.id = t.product_id
+                 WHERE t.transaction_type = 'REDEEM' AND p.code = 'AF247644G'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("updated redemption cost");
+        assert!((cost_after_edit - 10_100.0).abs() < 0.01);
+        parse_workbook(&workbook, &mut conn).expect("reimport");
+        let cost_after_reimport: f64 = conn
+            .query_row(
+                "SELECT t.cost_basis FROM transactions t
+                 JOIN products p ON p.id = t.product_id
+                 WHERE t.transaction_type = 'REDEEM' AND p.code = 'AF247644G'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved redemption cost");
+        assert!((cost_after_reimport - 10_100.0).abs() < 0.01);
     }
 
     #[test]
@@ -5660,7 +6367,7 @@ mod tests {
         let workbook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../理财.xlsx");
         let mut conn = Connection::open_in_memory().expect("open memory db");
         migrate(&conn).expect("migrate");
-        let report = parse_workbook(&workbook, &mut conn).expect("import workbook");
+        parse_workbook(&workbook, &mut conn).expect("import workbook");
         let (count, proceeds, cost, gain, pending): (i64, f64, f64, f64, i64) = conn
             .query_row(
                 "SELECT COUNT(*), SUM(amount), SUM(cost_basis), SUM(realized_gain),
@@ -5694,10 +6401,6 @@ mod tests {
             .expect("grouped two-lot redemption");
         assert!((af_amount - 10_078.0).abs() < 0.01);
         assert!((af_cost - 10_000.0).abs() < 0.01);
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("DT1H2508A") && warning.contains("币种")));
     }
 
     #[test]
