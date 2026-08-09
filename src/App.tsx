@@ -4,6 +4,8 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
   Activity,
+  ArrowDown,
+  ArrowUp,
   BarChart3,
   BellRing,
   CalendarDays,
@@ -33,6 +35,8 @@ import "./App.css";
 type View = "overview" | "holdings" | "transactions" | "calendar" | "analytics" | "masterData" | "reconciliation";
 type CurrencyCode = "CNY" | "USD";
 type EntryOperation = "BUY" | "SELL" | "PRODUCT_MATURITY" | "VALUATION" | "DIVIDEND" | "FEE" | "TRANSFER" | "DEPOSIT_OPEN" | "DEPOSIT_MATURITY";
+type ProductSortKey = "name" | "code" | "riskLevel";
+type SortDirection = "asc" | "desc";
 
 type CurrencySummary = {
   currency: CurrencyCode;
@@ -856,12 +860,34 @@ function AnalyticsView({ analytics, currency, onCurrencyChange }: { analytics: A
   );
 }
 
+function ProductSortHeader({ label, sortKey, activeKey, direction, onSort }: { label: string; sortKey: ProductSortKey; activeKey: ProductSortKey; direction: SortDirection; onSort: (key: ProductSortKey) => void }) {
+  const active = sortKey === activeKey;
+  return <th aria-sort={active ? direction === "asc" ? "ascending" : "descending" : "none"}><button className={`sortable-header ${active ? "active" : ""}`} type="button" onClick={() => onSort(sortKey)}>{label}{active ? direction === "asc" ? <ArrowUp /> : <ArrowDown /> : <span className="sort-placeholder">↕</span>}</button></th>;
+}
+
 function MasterDataView({ data, onEdit }: { data: MasterData; onEdit: (target: EditableRecord) => void }) {
   const [section, setSection] = useState<"products" | "accounts" | "deposits">("products");
+  const [productSort, setProductSort] = useState<{ key: ProductSortKey; direction: SortDirection }>({ key: "code", direction: "asc" });
+  const sortedProducts = useMemo(() => {
+    const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+    return [...data.products].sort((left, right) => {
+      const leftValue = (left[productSort.key] ?? "").trim();
+      const rightValue = (right[productSort.key] ?? "").trim();
+      if (!leftValue && rightValue) return 1;
+      if (leftValue && !rightValue) return -1;
+      const primary = collator.compare(leftValue, rightValue) * (productSort.direction === "asc" ? 1 : -1);
+      if (primary !== 0) return primary;
+      const byCode = collator.compare(left.code, right.code);
+      return byCode !== 0 ? byCode : left.id - right.id;
+    });
+  }, [data.products, productSort]);
+  const changeProductSort = (key: ProductSortKey) => {
+    setProductSort((current) => current.key === key ? { key, direction: current.direction === "asc" ? "desc" : "asc" } : { key, direction: "asc" });
+  };
   return (
     <article className="panel table-panel master-panel">
       <div className="panel-header"><div><h2>资料管理</h2><span>修改会自动备份并保留变更审计；手工修正不会被下次导入覆盖</span></div><div className="segmented"><button className={section === "products" ? "active" : ""} onClick={() => setSection("products")}>产品 {data.products.length}</button><button className={section === "accounts" ? "active" : ""} onClick={() => setSection("accounts")}>账户 {data.accounts.length}</button><button className={section === "deposits" ? "active" : ""} onClick={() => setSection("deposits")}>存款 {data.deposits.length}</button></div></div>
-      {section === "products" && <div className="table-scroll"><table><thead><tr><th>产品（代码升序）</th><th>币种</th><th>发行机构</th><th>风险等级</th><th>来源</th><th /></tr></thead><tbody>{data.products.map((item) => <tr key={item.id}><td><strong>{item.name}</strong><span>{item.code}</span></td><td>{item.currency}</td><td>{item.issuer ?? "—"}</td><td>{item.riskLevel ?? "—"}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "product", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
+      {section === "products" && <div className="table-scroll"><table className="product-table"><thead><tr><ProductSortHeader label="名称" sortKey="name" activeKey={productSort.key} direction={productSort.direction} onSort={changeProductSort} /><ProductSortHeader label="代码" sortKey="code" activeKey={productSort.key} direction={productSort.direction} onSort={changeProductSort} /><th>币种</th><th>发行机构</th><ProductSortHeader label="风险等级" sortKey="riskLevel" activeKey={productSort.key} direction={productSort.direction} onSort={changeProductSort} /><th>来源</th><th /></tr></thead><tbody>{sortedProducts.map((item) => <tr key={item.id}><td><strong>{item.name}</strong></td><td className="product-code">{item.code}</td><td>{item.currency}</td><td>{item.issuer ?? "—"}</td><td>{item.riskLevel ?? "—"}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "product", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
       {section === "accounts" && <div className="table-scroll"><table><thead><tr><th>账户</th><th>币种</th><th>来源</th><th /></tr></thead><tbody>{data.accounts.map((item) => <tr key={item.id}><td><strong>{item.institution}</strong><span>{item.name}</span></td><td>{item.currency}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "account", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
       {section === "deposits" && <div className="table-scroll"><table><thead><tr><th>存款</th><th>账户</th><th>币种</th><th className="number">本金</th><th>到期日</th><th>年利率</th><th>状态</th><th /></tr></thead><tbody>{data.deposits.map((item) => <tr key={item.id}><td><strong>{item.name}</strong><span>{item.source === "excel" ? "Excel 导入" : "手工录入"}</span></td><td>{item.institution}</td><td>{item.currency}</td><td className="number">{formatMoney(item.principal, item.currency)}</td><td>{item.maturityDate}</td><td>{formatPercent(item.annualRate)}</td><td><span className="status">{item.status === "active" ? "持有中" : item.status === "matured" ? "已到期" : "已取消"}</span></td><td><button className="icon-button" onClick={() => onEdit({ entityType: "deposit", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
     </article>
