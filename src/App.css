@@ -272,6 +272,17 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
 .batch-meta label { display: grid; gap: 6px; color: #59675f; font-size: 11px; }
 .batch-meta input, .batch-row input { width: 100%; min-width: 0; border: 1px solid #d5ded7; border-radius: 8px; padding: 8px 9px; outline: none; color: #17211b; background: #fff; }
 .batch-meta input:focus, .batch-row input:focus { border-color: #397b58; box-shadow: 0 0 0 3px rgba(46,125,85,.1); }
+.segmented-date { width: 100%; min-width: 0; display: grid; grid-template-columns: minmax(42px, 1.4fr) minmax(29px, .8fr) minmax(29px, .8fr); align-items: center; overflow: hidden; border: 1px solid #d5ded7; border-radius: 8px; background: #fff; color: #17211b; transition: border-color .15s ease, box-shadow .15s ease; }
+.segmented-date:focus-within { border-color: #397b58; box-shadow: 0 0 0 3px rgba(46,125,85,.1); }
+.date-segment-part { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; }
+.date-segment-part:first-child { grid-template-columns: minmax(0, 1fr); }
+.date-segment-part i { color: #9aa59e; font-size: 10px; font-style: normal; user-select: none; }
+.entry-form .segmented-date input,
+.batch-meta .segmented-date input,
+.filter-bar .segmented-date input { width: 100%; min-width: 0; border: 0; border-radius: 0; padding: 8px 2px; outline: none; box-shadow: none; background: transparent; color: inherit; text-align: center; font-variant-numeric: tabular-nums; }
+.entry-form .segmented-date input:focus,
+.batch-meta .segmented-date input:focus,
+.filter-bar .segmented-date input:focus { border: 0; box-shadow: none; }
 .batch-list { border: 1px solid #e0e7e2; border-radius: 10px; overflow: hidden; }
 .batch-list-head, .batch-row { display: grid; grid-template-columns: minmax(250px, 1fr) 135px 150px 135px; gap: 12px; align-items: center; }
 .batch-list-head { padding: 8px 11px; background: #f2f5f3; color: #748179; font-size: 10px; }

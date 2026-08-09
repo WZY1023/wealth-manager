@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
@@ -221,6 +221,53 @@ function formatPercent(value: number) {
   return new Intl.NumberFormat("zh-CN", { style: "percent", maximumFractionDigits: 2 }).format(value);
 }
 
+type DateInputProps = {
+  value: string;
+  onChange: (value: string) => void;
+  required?: boolean;
+  ariaLabel?: string;
+};
+
+function DateInput({ value, onChange, required = false, ariaLabel = "日期" }: DateInputProps) {
+  const yearRef = useRef<HTMLInputElement>(null);
+  const monthRef = useRef<HTMLInputElement>(null);
+  const dayRef = useRef<HTMLInputElement>(null);
+  const [year = "", month = "", day = ""] = value ? value.split("-", 3) : [];
+  const parts = [year, month, day];
+  const limits = [4, 2, 2];
+  const refs = [yearRef, monthRef, dayRef];
+  const labels = ["年", "月", "日"];
+  const patterns = ["[0-9]{4}", "(0[1-9]|1[0-2])", "(0[1-9]|[12][0-9]|3[01])"];
+  const segmentRequired = required || parts.some((part) => part.length > 0);
+
+  const focusSegment = (index: number) => {
+    requestAnimationFrame(() => {
+      refs[index]?.current?.focus();
+      refs[index]?.current?.select();
+    });
+  };
+  const updatePart = (index: number, rawValue: string) => {
+    const nextPart = rawValue.replace(/\D/g, "").slice(0, limits[index]);
+    const nextParts = [...parts];
+    nextParts[index] = nextPart;
+    onChange(nextParts.every((part) => !part) ? "" : nextParts.join("-"));
+    if (nextPart.length === limits[index] && index < refs.length - 1) focusSegment(index + 1);
+  };
+  const handlePaste = (event: React.ClipboardEvent<HTMLInputElement>) => {
+    const digits = event.clipboardData.getData("text").replace(/\D/g, "");
+    if (digits.length !== 8) return;
+    event.preventDefault();
+    onChange(`${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`);
+    focusSegment(2);
+  };
+
+  return (
+    <span className="segmented-date" role="group" aria-label={ariaLabel}>
+      {parts.map((part, index) => <span className="date-segment-part" key={labels[index]}>{index > 0 && <i aria-hidden="true">/</i>}<input ref={refs[index]} required={segmentRequired} aria-label={`${ariaLabel}${labels[index]}`} inputMode="numeric" autoComplete="off" maxLength={limits[index]} pattern={patterns[index]} placeholder={labels[index]} value={part} onFocus={(event) => event.currentTarget.select()} onPaste={handlePaste} onKeyDown={(event) => { if (event.key === "Backspace" && !part && index > 0) { event.preventDefault(); focusSegment(index - 1); } }} onChange={(event) => updatePart(index, event.target.value)} /></span>)}
+    </span>
+  );
+}
+
 function App() {
   const [view, setView] = useState<View>("overview");
   const [currency, setCurrency] = useState<CurrencyCode>("CNY");
@@ -277,6 +324,17 @@ function App() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    const blockNumberWheel = (event: WheelEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLInputElement && target.type === "number" && document.activeElement === target) {
+        event.preventDefault();
+      }
+    };
+    document.addEventListener("wheel", blockNumberWheel, { capture: true, passive: false });
+    return () => document.removeEventListener("wheel", blockNumberWheel, { capture: true });
+  }, []);
 
   const importExcel = async () => {
     setError(null);
@@ -772,7 +830,7 @@ function BatchValuationModal({ holdings, onClose, onSave }: { holdings: Holding[
       <section className="modal batch-valuation-modal" role="dialog" aria-modal="true" aria-labelledby="batch-title" onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-header"><div><h2 id="batch-title">批量更新市值</h2><p>一次完成全部持仓的周度估值；未变化的数值也会留下本次确认记录</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
         <form onSubmit={(event) => void submit(event)}>
-          <div className="batch-meta"><label>估值日期<input required type="date" value={valuationDate} onChange={(event) => setValuationDate(event.target.value)} /></label><label>备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：周末统一更新" /></label></div>
+          <div className="batch-meta"><label>估值日期<DateInput required ariaLabel="估值日期" value={valuationDate} onChange={setValuationDate} /></label><label>备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：周末统一更新" /></label></div>
           <div className="batch-list"><div className="batch-list-head"><span>产品、代码与渠道</span><span>原市值</span><span>本次市值</span><span>变化</span></div>{sortedHoldings.map((item) => {
             const key = `${item.productId}:${item.accountId}`;
             const next = Number(values[key]);
@@ -952,7 +1010,7 @@ function BalanceReconciliationModal({ account, onClose, onSave }: { account: Acc
       <section className="modal reconciliation-modal" role="dialog" aria-modal="true" aria-labelledby="reconciliation-title" onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-header"><div><h2 id="reconciliation-title">核对 {account.institution}</h2><p>{account.name} · {account.currency}</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
         <div className="reconciliation-breakdown"><div><span>理财市值</span><strong>{formatMoney(account.wealthValue, account.currency)}</strong></div><div><span>有效定存本金</span><strong>{formatMoney(account.depositValue, account.currency)}</strong></div><div><span>账本资产合计</span><strong>{formatMoney(account.trackedTotal, account.currency)}</strong></div></div>
-        <form className="entry-form reconciliation-form" onSubmit={(event) => void submit(event)}><label>对账日期<input required type="date" value={balanceDate} onChange={(event) => setBalanceDate(event.target.value)} /></label><label>银行显示总资产<input required autoFocus type="number" min="0" step="0.01" value={actualBalance} onChange={(event) => setActualBalance(event.target.value)} placeholder="输入银行页面的账户总资产" /></label><label className="full-field">备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：包含活期余额、待入账收益" /></label><div className={`reconciliation-difference full-field ${difference === null ? "" : Math.abs(difference) <= (account.currency === "USD" ? 0.01 : 1) ? "matched" : "unmatched"}`}><span>预计差额</span><strong>{difference === null ? "—" : formatMoney(difference, account.currency)}</strong><small>{difference === null ? "录入银行总资产后自动计算" : Math.abs(difference) <= (account.currency === "USD" ? 0.01 : 1) ? "与账本一致" : "差额可能来自未录入现金、漏记产品或入账时间差"}</small></div><div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Scale />{submitting ? "保存中…" : "保存对账"}</button></div></form>
+        <form className="entry-form reconciliation-form" onSubmit={(event) => void submit(event)}><label>对账日期<DateInput required ariaLabel="对账日期" value={balanceDate} onChange={setBalanceDate} /></label><label>银行显示总资产<input required autoFocus type="number" min="0" step="0.01" value={actualBalance} onChange={(event) => setActualBalance(event.target.value)} placeholder="输入银行页面的账户总资产" /></label><label className="full-field">备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：包含活期余额、待入账收益" /></label><div className={`reconciliation-difference full-field ${difference === null ? "" : Math.abs(difference) <= (account.currency === "USD" ? 0.01 : 1) ? "matched" : "unmatched"}`}><span>预计差额</span><strong>{difference === null ? "—" : formatMoney(difference, account.currency)}</strong><small>{difference === null ? "录入银行总资产后自动计算" : Math.abs(difference) <= (account.currency === "USD" ? 0.01 : 1) ? "与账本一致" : "差额可能来自未录入现金、漏记产品或入账时间差"}</small></div><div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Scale />{submitting ? "保存中…" : "保存对账"}</button></div></form>
       </section>
     </div>
   );
@@ -1004,7 +1062,7 @@ function TransactionsView({ transactions, onSelect, loading }: {
   return (
     <article className="panel table-panel">
       <div className="panel-header"><div><h2>交易流水</h2><span>显示 {filtered.length}/{transactions.length} 笔 · 筛选结果已实现收益 {formatMoney(gains.CNY, "CNY")} / {formatMoney(gains.USD, "USD")}</span></div><button className="button secondary compact" type="button" onClick={() => { setSearchText(""); setOperationFilter("all"); setCurrencyFilter("all"); setInstitutionFilter("all"); setStatusFilter("all"); setDateFrom(""); setDateTo(""); }}><ListFilter />清除筛选</button></div>
-      <div className="filter-bar transaction-filters"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索产品、代码、银行或备注" /></label><select value={operationFilter} onChange={(event) => setOperationFilter(event.target.value)}><option value="all">全部操作</option>{Object.entries(operationLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><select value={currencyFilter} onChange={(event) => setCurrencyFilter(event.target.value)}><option value="all">全部币种</option><option value="CNY">人民币</option><option value="USD">美元</option></select><select value={institutionFilter} onChange={(event) => setInstitutionFilter(event.target.value)}><option value="all">全部银行</option>{institutions.map((institution) => <option key={institution} value={institution}>{institution}</option>)}</select><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">全部状态</option><option value="effective">有效流水</option><option value="reversed">冲销记录</option><option value="review">待核对</option></select><div className="transaction-date-range"><label className="date-filter">从<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /></label><label className="date-filter">至<input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /></label></div></div>
+      <div className="filter-bar transaction-filters"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索产品、代码、银行或备注" /></label><select value={operationFilter} onChange={(event) => setOperationFilter(event.target.value)}><option value="all">全部操作</option>{Object.entries(operationLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><select value={currencyFilter} onChange={(event) => setCurrencyFilter(event.target.value)}><option value="all">全部币种</option><option value="CNY">人民币</option><option value="USD">美元</option></select><select value={institutionFilter} onChange={(event) => setInstitutionFilter(event.target.value)}><option value="all">全部银行</option>{institutions.map((institution) => <option key={institution} value={institution}>{institution}</option>)}</select><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">全部状态</option><option value="effective">有效流水</option><option value="reversed">冲销记录</option><option value="review">待核对</option></select><div className="transaction-date-range"><label className="date-filter">从<DateInput ariaLabel="开始日期" value={dateFrom} onChange={setDateFrom} /></label><label className="date-filter">至<DateInput ariaLabel="结束日期" value={dateTo} onChange={setDateTo} /></label></div></div>
       <div className="table-scroll"><table className="transaction-table"><colgroup><col className="transaction-date-col" /><col className="transaction-operation-col" /><col /><col className="transaction-currency-col" /><col className="transaction-money-col" /><col className="transaction-money-col" /><col className="transaction-money-col" /><col className="transaction-note-col" /></colgroup><thead><tr><th>日期</th><th>操作</th><th>产品</th><th>币种</th><th className="number">现金金额</th><th className="number">核销成本</th><th className="number">已实现收益</th><th>备注</th></tr></thead><tbody>
         {filtered.map((item) => {
           const incoming = ["SELL", "REDEEM", "PRODUCT_MATURITY", "DEPOSIT_MATURITY", "DIVIDEND"].includes(item.operation);
@@ -1107,7 +1165,7 @@ function TransactionEditModal({ detail, onClose, onSave }: { detail: Transaction
         <div className="modal-header"><div><h2 id="transaction-edit-title">修改交易记录</h2><p>{detail.title}{detail.code ? ` · ${detail.code}` : ""}</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
         <div className="redemption-context"><div><span>操作类型</span><strong>{operationLabels[detail.operation] ?? detail.operation}</strong></div><div><span>银行/渠道</span><strong>{detail.institution ?? "—"}</strong></div><div><span>币种</span><strong>{detail.currency}</strong></div></div>
         <form className="entry-form redemption-form" onSubmit={(event) => void submit(event)}>
-          <label>操作日期<input required type="date" value={tradeDate} onChange={(event) => setTradeDate(event.target.value)} /></label>
+          <label>操作日期<DateInput required ariaLabel="操作日期" value={tradeDate} onChange={setTradeDate} /></label>
           <label>{amountLabel[detail.operation] ?? "金额"}<input required autoFocus type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} /></label>
           <label className="full-field">备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="补充银行流水、用途或核对说明" /></label>
           <div className="calculation-note full-field">操作类型、产品、银行和币种保持不变；保存后会自动重算 FIFO 成本、持仓市值与收益。{detail.source === "excel" ? "这条 Excel 修正会在以后重新导入时继续沿用。" : "修改前会自动备份数据库，并保留审计记录。"}</div>
@@ -1140,7 +1198,7 @@ function HistoricalRedemptionModal({ detail, onClose, onSave }: { detail: Transa
       <section className="modal redemption-modal" role="dialog" aria-modal="true" aria-labelledby="redemption-title" onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-header"><div><h2 id="redemption-title">核对历史赎回</h2><p>{detail.title}{detail.code ? ` · ${detail.code}` : ""}</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
         <div className="redemption-context"><div><span>银行/渠道</span><strong>{detail.institution ?? "—"}</strong></div><div><span>原买入成本</span><strong>{formatMoney(detail.costBasis, detail.currency)}</strong></div><div><span>{detail.needsReview ? "当前占位金额" : "当前到账金额"}</span><strong>{formatMoney(detail.amount, detail.currency)}</strong></div></div>
-        <form className="entry-form redemption-form" onSubmit={(event) => void submit(event)}><label>实际赎回日期<input required type="date" value={tradeDate} onChange={(event) => setTradeDate(event.target.value)} /></label><label>银行实际到账金额<input required autoFocus type="number" min="0" step="0.01" value={proceeds} onChange={(event) => setProceeds(event.target.value)} /></label><label className="full-field">核对说明（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：银行流水已核对、含分红或手续费" /></label><div className={`redemption-result full-field ${realizedGain === null ? "" : realizedGain >= 0 ? "gain" : "loss"}`}><span>本批次已实现收益</span><strong>{realizedGain === null ? "—" : formatMoney(realizedGain, detail.currency)}</strong><small>实际到账金额 − 原买入成本；保存后将更新收益分析和 XIRR</small></div><div className="calculation-note full-field">核对结果保存在软件数据库中，不修改原 Excel；以后重新导入同一批次时会自动沿用。</div><div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><CheckCircle2 />{submitting ? "保存中…" : "确认核对"}</button></div></form>
+        <form className="entry-form redemption-form" onSubmit={(event) => void submit(event)}><label>实际赎回日期<DateInput required ariaLabel="实际赎回日期" value={tradeDate} onChange={setTradeDate} /></label><label>银行实际到账金额<input required autoFocus type="number" min="0" step="0.01" value={proceeds} onChange={(event) => setProceeds(event.target.value)} /></label><label className="full-field">核对说明（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：银行流水已核对、含分红或手续费" /></label><div className={`redemption-result full-field ${realizedGain === null ? "" : realizedGain >= 0 ? "gain" : "loss"}`}><span>本批次已实现收益</span><strong>{realizedGain === null ? "—" : formatMoney(realizedGain, detail.currency)}</strong><small>实际到账金额 − 原买入成本；保存后将更新收益分析和 XIRR</small></div><div className="calculation-note full-field">核对结果保存在软件数据库中，不修改原 Excel；以后重新导入同一批次时会自动沿用。</div><div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><CheckCircle2 />{submitting ? "保存中…" : "确认核对"}</button></div></form>
       </section>
     </div>
   );
@@ -1205,7 +1263,7 @@ function MasterDataEditModal({ target, accounts, onClose, onSave }: { target: Ed
           <label className="full-field">名称<input required value={name} onChange={(event) => setName(event.target.value)} /></label>
           {product && <><label>产品代码<input required value={code} onChange={(event) => setCode(event.target.value)} /></label><label>币种<select value={currency} onChange={(event) => setCurrency(event.target.value as CurrencyCode)}><option value="CNY">人民币 CNY</option><option value="USD">美元 USD</option></select></label><label>发行机构<input value={issuer} onChange={(event) => setIssuer(event.target.value)} /></label><label>风险等级<input value={riskLevel} onChange={(event) => setRiskLevel(event.target.value)} placeholder="例如 R2" /></label><label className="full-field">购买银行<input value={product.purchaseBanks.join("、") || "尚无购买记录"} disabled /></label></>}
           {account && <><label>银行/机构<input required value={institution} onChange={(event) => setInstitution(event.target.value)} /></label><label>币种<select value={currency} onChange={(event) => setCurrency(event.target.value as CurrencyCode)}><option value="CNY">人民币 CNY</option><option value="USD">美元 USD</option></select></label></>}
-          {deposit && <><label>存款账户<select required value={accountId} onChange={(event) => { setAccountId(event.target.value); const selected = accounts.find((item) => item.id.toString() === event.target.value); if (selected) setCurrency(selected.currency); }}><option value="">请选择</option>{accounts.map((item) => <option value={item.id} key={item.id}>{item.institution} · {item.name} · {item.currency}</option>)}</select></label><label>币种<input value={currency} disabled /></label><label>本金<input required type="number" min="0.01" step="0.01" value={principal} onChange={(event) => setPrincipal(event.target.value)} /></label><label>年利率（%）<input required type="number" min="0" max="100" step="0.01" value={annualRate} onChange={(event) => setAnnualRate(event.target.value)} /></label><label>起息日（可选）<input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} /></label><label>到期日<input required type="date" value={maturityDate} onChange={(event) => setMaturityDate(event.target.value)} /></label></>}
+          {deposit && <><label>存款账户<select required value={accountId} onChange={(event) => { setAccountId(event.target.value); const selected = accounts.find((item) => item.id.toString() === event.target.value); if (selected) setCurrency(selected.currency); }}><option value="">请选择</option>{accounts.map((item) => <option value={item.id} key={item.id}>{item.institution} · {item.name} · {item.currency}</option>)}</select></label><label>币种<input value={currency} disabled /></label><label>本金<input required type="number" min="0.01" step="0.01" value={principal} onChange={(event) => setPrincipal(event.target.value)} /></label><label>年利率（%）<input required type="number" min="0" max="100" step="0.01" value={annualRate} onChange={(event) => setAnnualRate(event.target.value)} /></label><label>起息日（可选）<DateInput ariaLabel="起息日" value={startDate} onChange={setStartDate} /></label><label>到期日<DateInput required ariaLabel="到期日" value={maturityDate} onChange={setMaturityDate} /></label></>}
           <div className="calculation-note full-field">已有账本记录的产品和账户不能修改币种；Excel 导入项目的手工修正会在后续导入时保留。</div>
           <div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Save />{submitting ? "保存中…" : "保存修改"}</button></div>
         </form>
@@ -1297,11 +1355,11 @@ function EntryModal({ holdings, deposits, accounts, onClose, onSave }: {
           {operation === "TRANSFER" && <><label>转出账户<select required value={sourceAccountChoice} onChange={(event) => setSourceAccountChoice(event.target.value)}><option value="">请选择</option>{accounts.map((item) => <option key={item.id} value={item.id}>{item.institution} · {item.name} · {item.currency}</option>)}</select></label><label>转入账户<select required value={targetAccountChoice} onChange={(event) => setTargetAccountChoice(event.target.value)}><option value="">请选择</option>{accounts.filter((item) => item.id.toString() !== sourceAccountChoice).map((item) => <option key={item.id} value={item.id}>{item.institution} · {item.name} · {item.currency}</option>)}</select></label></>}
 
           {operation === "BUY" && !isExistingBuy && <><label className="full-field">产品名称<input required value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：稳富固收增强" /></label><label>产品代码<input required value={code} onChange={(event) => setCode(event.target.value)} /></label><label>购买渠道<input required value={institution} onChange={(event) => setInstitution(event.target.value)} placeholder="例如：中国银行" /></label><label>币种<select value={currency} onChange={(event) => setCurrency(event.target.value as CurrencyCode)}><option value="CNY">人民币 CNY</option><option value="USD">美元 USD</option></select></label></>}
-          {operation === "DEPOSIT_OPEN" && <><label className="full-field">存款名称<input required value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：整存整取-3年" /></label><label>存款银行<input required value={institution} onChange={(event) => setInstitution(event.target.value)} /></label><label>币种<select value={currency} onChange={(event) => setCurrency(event.target.value as CurrencyCode)}><option value="CNY">人民币 CNY</option><option value="USD">美元 USD</option></select></label><label>到期日<input required type="date" value={maturityDate} onChange={(event) => setMaturityDate(event.target.value)} /></label><label>年利率（%）<input required type="number" min="0" max="100" step="0.01" value={annualRate} onChange={(event) => setAnnualRate(event.target.value)} placeholder="2.85" /></label></>}
+          {operation === "DEPOSIT_OPEN" && <><label className="full-field">存款名称<input required value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：整存整取-3年" /></label><label>存款银行<input required value={institution} onChange={(event) => setInstitution(event.target.value)} /></label><label>币种<select value={currency} onChange={(event) => setCurrency(event.target.value as CurrencyCode)}><option value="CNY">人民币 CNY</option><option value="USD">美元 USD</option></select></label><label>到期日<DateInput required ariaLabel="到期日" value={maturityDate} onChange={setMaturityDate} /></label><label>年利率（%）<input required type="number" min="0" max="100" step="0.01" value={annualRate} onChange={(event) => setAnnualRate(event.target.value)} placeholder="2.85" /></label></>}
 
           {operation !== "VALUATION" && <label>{operation === "BUY" ? "买入金额" : operation === "DEPOSIT_OPEN" ? "存款本金" : operation === "DIVIDEND" ? "分红金额" : operation === "FEE" ? "费用金额" : operation === "TRANSFER" ? "转账金额" : "实际到账金额"}<input required type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} /></label>}
           {operation === "VALUATION" && <label>当前总市值<input required type="number" min="0.01" step="0.01" value={marketValue} onChange={(event) => setMarketValue(event.target.value)} /></label>}
-          <label>操作日期<input required type="date" value={tradeDate} onChange={(event) => setTradeDate(event.target.value)} /></label>
+          <label>操作日期<DateInput required ariaLabel="操作日期" value={tradeDate} onChange={setTradeDate} /></label>
           <label className="full-field">备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="银行流水说明、确认号等" /></label>
 
           {operation === "SELL" && selectedHolding && <div className="calculation-note full-field">将以当前市值 {formatMoney(selectedHolding.marketValue, selectedHolding.currency)} 为基准，按卖出比例计算应核销成本，并从最早的买入批次开始自动扣减。</div>}
