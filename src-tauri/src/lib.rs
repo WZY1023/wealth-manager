@@ -6,6 +6,7 @@ use rust_xlsxwriter::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -184,6 +185,15 @@ struct BalanceSnapshotInput {
     note: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoricalRedemptionInput {
+    transaction_id: i64,
+    trade_date: String,
+    proceeds: f64,
+    note: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QualityIssue {
@@ -336,6 +346,8 @@ struct TransactionDetail {
     reversed_by: Option<i64>,
     reversal_of: Option<i64>,
     can_reverse: bool,
+    can_confirm_historical_redemption: bool,
+    needs_review: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -367,6 +379,20 @@ struct ReversalTarget {
     realized_gain: f64,
     valuation_before: Option<f64>,
     valuation_after: Option<f64>,
+}
+
+struct HistoricalRedemptionRecord {
+    source_row: i64,
+    product_code: String,
+    institution: String,
+    currency: String,
+    original_cost: f64,
+    original_end_date: String,
+    trade_date: String,
+    amount: f64,
+    cost_basis: f64,
+    realized_gain: f64,
+    note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -542,6 +568,22 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           FOREIGN KEY(account_id) REFERENCES accounts(id),
           UNIQUE(account_id, balance_date)
         );
+
+        CREATE TABLE IF NOT EXISTS historical_redemption_confirmations (
+          id INTEGER PRIMARY KEY,
+          redemption_key TEXT NOT NULL UNIQUE,
+          source_row INTEGER,
+          product_code TEXT NOT NULL,
+          institution TEXT NOT NULL,
+          currency TEXT NOT NULL,
+          original_cost REAL NOT NULL,
+          original_end_date TEXT NOT NULL,
+          confirmed_trade_date TEXT NOT NULL,
+          proceeds REAL NOT NULL,
+          note TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
         "#,
     )?;
     ensure_column(
@@ -557,6 +599,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "REAL NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "transactions", "deposit_id", "INTEGER")?;
+    ensure_column(conn, "transactions", "product_id", "INTEGER")?;
+    ensure_column(conn, "transactions", "account_id", "INTEGER")?;
+    ensure_column(conn, "transactions", "source_row", "INTEGER")?;
     ensure_column(conn, "transactions", "transfer_account_id", "INTEGER")?;
     ensure_column(conn, "transactions", "valuation_before", "REAL")?;
     ensure_column(conn, "transactions", "valuation_after", "REAL")?;
@@ -564,6 +609,14 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "transactions", "reversed_by", "INTEGER")?;
     ensure_column(conn, "position_lots", "remaining_amount", "REAL")?;
     ensure_column(conn, "position_lots", "transaction_id", "INTEGER")?;
+    ensure_column(conn, "position_lots", "end_date", "TEXT")?;
+    ensure_column(conn, "position_lots", "source_row", "INTEGER")?;
+    ensure_column(
+        conn,
+        "position_lots",
+        "source",
+        "TEXT NOT NULL DEFAULT 'manual'",
+    )?;
     ensure_column(conn, "valuations", "transaction_id", "INTEGER")?;
     ensure_column(conn, "deposits", "status", "TEXT NOT NULL DEFAULT 'active'")?;
     ensure_column(conn, "deposits", "matured_at", "TEXT")?;
@@ -602,6 +655,36 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS one_current_valuation_per_holding
          ON valuations(product_id, account_id) WHERE is_current = 1",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE transactions
+         SET cost_basis = COALESCE((
+               SELECT l.original_amount FROM position_lots l
+               WHERE l.source = 'excel' AND l.source_row = transactions.source_row
+                 AND l.product_id = transactions.product_id
+                 AND l.account_id = transactions.account_id
+               LIMIT 1
+             ), (
+               SELECT SUM(l.original_amount) FROM position_lots l
+               WHERE l.source = 'excel' AND l.status = 'closed'
+                 AND l.product_id = transactions.product_id
+                 AND l.account_id = transactions.account_id
+             ), cost_basis),
+             realized_gain = amount - COALESCE((
+               SELECT l.original_amount FROM position_lots l
+               WHERE l.source = 'excel' AND l.source_row = transactions.source_row
+                 AND l.product_id = transactions.product_id
+                 AND l.account_id = transactions.account_id
+               LIMIT 1
+             ), (
+               SELECT SUM(l.original_amount) FROM position_lots l
+               WHERE l.source = 'excel' AND l.status = 'closed'
+                 AND l.product_id = transactions.product_id
+                 AND l.account_id = transactions.account_id
+             ), cost_basis)
+         WHERE source = 'excel' AND transaction_type = 'REDEEM'
+           AND COALESCE(cost_basis, 0) <= 0.000001",
         [],
     )?;
     Ok(())
@@ -653,6 +736,23 @@ fn excel_date(cell: Option<&Data>) -> Option<NaiveDate> {
     ["%Y-%m-%d", "%m/%d/%y", "%m/%d/%Y"]
         .iter()
         .find_map(|format| NaiveDate::parse_from_str(value.trim(), format).ok())
+}
+
+fn historical_redemption_key(
+    code: &str,
+    institution: &str,
+    currency: &str,
+    original_cost: f64,
+    end_date: &str,
+) -> String {
+    format!(
+        "{}|{}|{}|{:.6}|{}",
+        code.trim(),
+        institution.trim(),
+        currency.trim().to_uppercase(),
+        original_cost,
+        end_date
+    )
 }
 
 fn account_id(tx: &Transaction<'_>, institution: &str, currency: &str) -> rusqlite::Result<i64> {
@@ -1915,30 +2015,22 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
             ],
         )
         .map_err(|error| error.to_string())?;
-        if !active {
-            tx.execute(
-                "INSERT INTO transactions (product_id, account_id, transaction_type, trade_date, amount, currency, note, cost_basis, source, source_row)
-                 VALUES (?1, ?2, 'REDEEM', ?3, ?4, ?5, '根据到期日期生成；赎回金额待核对', ?4, 'excel', ?6)",
-                params![
-                    product,
-                    account,
-                    end_date.unwrap_or(today).format("%Y-%m-%d").to_string(),
-                    amount,
-                    currency,
-                    (index + 1) as i64
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        }
         lots_imported += 1;
     }
 
     replay_manual_exits(&tx).map_err(|error| error.to_string())?;
 
+    let mut reading_historical_redemptions = false;
+    let mut historical_redemptions: HashMap<String, (String, String, f64, i64)> = HashMap::new();
     for (index, row) in summaries.rows().enumerate().skip(1) {
         let name = text(row.first());
         if name.is_empty() {
-            break;
+            reading_historical_redemptions = true;
+            continue;
+        }
+        if name == "名称" {
+            reading_historical_redemptions = true;
+            continue;
         }
         let code = text(row.get(1));
         let currency = text(row.get(2)).to_uppercase();
@@ -1946,9 +2038,30 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
         let market_value = number(row.get(4));
         if code.is_empty() || currency.is_empty() || market_value.is_none() {
             warnings.push(format!(
-                "Sheet2 第{}行缺少代码、币种或市值，已跳过",
+                "Sheet2 第{}行缺少代码、币种或金额，已跳过",
                 index + 1
             ));
+            continue;
+        }
+        if reading_historical_redemptions {
+            let key = format!("{}|{}", code.trim(), institution.trim());
+            if historical_redemptions
+                .insert(
+                    key,
+                    (
+                        name,
+                        currency,
+                        market_value.unwrap_or_default(),
+                        (index + 1) as i64,
+                    ),
+                )
+                .is_some()
+            {
+                warnings.push(format!(
+                    "Sheet2 第{}行的历史赎回产品 {code} 重复，已采用最后一行",
+                    index + 1
+                ));
+            }
             continue;
         }
         let existing_currency: Option<String> = tx
@@ -2000,6 +2113,126 @@ fn parse_workbook(path: &Path, conn: &mut Connection) -> Result<ImportReport, St
             ));
         }
         holdings_imported += 1;
+    }
+
+    let expired_groups = {
+        let mut statement = tx
+            .prepare(
+                "SELECT p.id, a.id, COALESCE(p.import_code, p.code),
+                        COALESCE(a.import_institution, a.institution), p.currency,
+                        SUM(l.original_amount), MAX(l.end_date), MIN(l.source_row)
+                 FROM position_lots l
+                 JOIN products p ON p.id = l.product_id
+                 JOIN accounts a ON a.id = l.account_id
+                 WHERE l.source = 'excel' AND l.status = 'closed'
+                 GROUP BY p.id, a.id, COALESCE(p.import_code, p.code),
+                          COALESCE(a.import_institution, a.institution), p.currency
+                 ORDER BY MIN(l.source_row)",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    let mut used_historical_redemptions = HashSet::new();
+    for (product, account, code, institution, currency, original_cost, end_date, first_lot_row) in
+        expired_groups
+    {
+        let redemption_key =
+            historical_redemption_key(&code, &institution, &currency, original_cost, &end_date);
+        let confirmation: Option<(String, f64, Option<String>, Option<i64>)> = tx
+            .query_row(
+                "SELECT confirmed_trade_date, proceeds, note, source_row
+                 FROM historical_redemption_confirmations WHERE redemption_key = ?1",
+                [&redemption_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let sheet_key = format!("{}|{}", code.trim(), institution.trim());
+        let (redemption_date, proceeds, redemption_note, transaction_source_row) = if let Some((
+            confirmed_date,
+            confirmed_proceeds,
+            note,
+            source_row,
+        )) =
+            confirmation
+        {
+            let note = note
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!("历史赎回已核对；{}", value.trim()))
+                .unwrap_or_else(|| "历史赎回已核对".to_string());
+            if historical_redemptions.contains_key(&sheet_key) {
+                used_historical_redemptions.insert(sheet_key.clone());
+            }
+            (
+                confirmed_date,
+                confirmed_proceeds,
+                note,
+                source_row.unwrap_or(first_lot_row),
+            )
+        } else if let Some((_, sheet_currency, sheet_proceeds, source_row)) =
+            historical_redemptions.get(&sheet_key)
+        {
+            used_historical_redemptions.insert(sheet_key.clone());
+            if sheet_currency != &currency {
+                warnings.push(format!(
+                        "Sheet2 历史赎回产品 {code} 的币种为 {sheet_currency}，买入记录为 {currency}；已按产品买入币种 {currency} 处理"
+                    ));
+            }
+            (
+                end_date.clone(),
+                *sheet_proceeds,
+                "根据 Sheet2 历史赎回表导入；赎回日期按最后结束日".to_string(),
+                *source_row,
+            )
+        } else {
+            (
+                end_date.clone(),
+                original_cost,
+                "根据到期日期生成；赎回金额待核对".to_string(),
+                first_lot_row,
+            )
+        };
+        tx.execute(
+            "INSERT INTO transactions
+               (product_id, account_id, transaction_type, trade_date, amount, currency, note,
+                cost_basis, realized_gain, source, source_row)
+             VALUES (?1, ?2, 'REDEEM', ?3, ?4, ?5, ?6, ?7, ?8, 'excel', ?9)",
+            params![
+                product,
+                account,
+                redemption_date,
+                proceeds,
+                currency,
+                redemption_note,
+                original_cost,
+                proceeds - original_cost,
+                transaction_source_row
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    for (key, (name, _, _, source_row)) in &historical_redemptions {
+        if !used_historical_redemptions.contains(key) {
+            warnings.push(format!(
+                "Sheet2 第{source_row}行的历史赎回产品 {name} 没有找到对应的已结束买入批次"
+            ));
+        }
     }
 
     for (index, row) in deposits.rows().enumerate().skip(1) {
@@ -3411,6 +3644,137 @@ fn apply_balance_snapshot(
     })
 }
 
+fn apply_historical_redemption_confirmation(
+    conn: &mut Connection,
+    input: &HistoricalRedemptionInput,
+) -> Result<EntryResult, String> {
+    let trade_date = valid_date(&input.trade_date, "实际赎回日期")?;
+    if !input.proceeds.is_finite() || input.proceeds < 0.0 {
+        return Err("实际到账金额必须是大于或等于0的有效数字".to_string());
+    }
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let previous = tx
+        .query_row(
+            "SELECT t.source_row, COALESCE(p.import_code, p.code),
+                    COALESCE(a.import_institution, a.institution), t.currency,
+                    SUM(l.original_amount), MAX(l.end_date),
+                    t.trade_date, t.amount, COALESCE(t.cost_basis, 0),
+                    COALESCE(t.realized_gain, 0), t.note
+             FROM transactions t
+             JOIN products p ON p.id = t.product_id
+             JOIN accounts a ON a.id = t.account_id
+             JOIN position_lots l ON l.product_id = t.product_id
+               AND l.account_id = t.account_id AND l.source = 'excel'
+               AND l.status = 'closed'
+             WHERE t.id = ?1 AND t.transaction_type = 'REDEEM'
+               AND t.source = 'excel' AND t.reversed_by IS NULL
+            GROUP BY t.id, p.id, a.id",
+            [input.transaction_id],
+            |row| {
+                Ok(HistoricalRedemptionRecord {
+                    source_row: row.get(0)?,
+                    product_code: row.get(1)?,
+                    institution: row.get(2)?,
+                    currency: row.get(3)?,
+                    original_cost: row.get(4)?,
+                    original_end_date: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    trade_date: row.get(6)?,
+                    amount: row.get(7)?,
+                    cost_basis: row.get(8)?,
+                    realized_gain: row.get(9)?,
+                    note: row.get(10)?,
+                })
+            },
+        )
+        .map_err(|_| "没有找到可核对的 Excel 历史赎回记录".to_string())?;
+    if previous.original_end_date.is_empty() {
+        return Err("该历史批次缺少原结束日期，暂时无法核对".to_string());
+    }
+    let note = input
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let transaction_note = note
+        .as_deref()
+        .map(|value| format!("历史赎回已核对；{value}"))
+        .unwrap_or_else(|| "历史赎回已核对".to_string());
+    let realized_gain = input.proceeds - previous.original_cost;
+    let redemption_key = historical_redemption_key(
+        &previous.product_code,
+        &previous.institution,
+        &previous.currency,
+        previous.original_cost,
+        &previous.original_end_date,
+    );
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    tx.execute(
+        "INSERT INTO historical_redemption_confirmations
+           (redemption_key, source_row, product_code, institution, currency,
+            original_cost, original_end_date, confirmed_trade_date, proceeds, note,
+            created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+         ON CONFLICT(redemption_key) DO UPDATE SET
+           source_row = excluded.source_row,
+           confirmed_trade_date = excluded.confirmed_trade_date,
+           proceeds = excluded.proceeds,
+           note = excluded.note,
+           updated_at = excluded.updated_at",
+        params![
+            redemption_key,
+            previous.source_row,
+            previous.product_code,
+            previous.institution,
+            previous.currency,
+            previous.original_cost,
+            previous.original_end_date,
+            trade_date,
+            input.proceeds,
+            note,
+            now
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE transactions SET trade_date = ?1, amount = ?2, cost_basis = ?3,
+           realized_gain = ?4, note = ?5 WHERE id = ?6",
+        params![
+            trade_date,
+            input.proceeds,
+            previous.original_cost,
+            realized_gain,
+            transaction_note,
+            input.transaction_id
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    record_master_change(
+        &tx,
+        "historical_redemption",
+        input.transaction_id,
+        serde_json::json!({
+            "tradeDate": previous.trade_date,
+            "proceeds": previous.amount,
+            "costBasis": previous.cost_basis,
+            "realizedGain": previous.realized_gain,
+            "note": previous.note,
+        }),
+        serde_json::json!({
+            "tradeDate": trade_date,
+            "proceeds": input.proceeds,
+            "costBasis": previous.original_cost,
+            "realizedGain": realized_gain,
+            "note": transaction_note,
+        }),
+    )?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(EntryResult {
+        message: "历史赎回已核对，实际收益和 XIRR 已重新计算".to_string(),
+        realized_gain: Some(realized_gain),
+    })
+}
+
 fn record_master_change(
     tx: &Transaction<'_>,
     entity_type: &str,
@@ -3922,12 +4286,13 @@ fn import_workbook(path: String, state: State<'_, AppState>) -> Result<ImportRep
     if !path.exists() {
         return Err("所选文件不存在".to_string());
     }
+    let resolved_path = fs::canonicalize(path).map_err(|error| error.to_string())?;
     let mut conn = state
         .db
         .lock()
         .map_err(|_| "数据库正在使用中".to_string())?;
     create_auto_backup(&conn, &state.backup_dir, "pre-import")?;
-    parse_workbook(path, &mut conn)
+    parse_workbook(&resolved_path, &mut conn)
 }
 
 #[tauri::command]
@@ -4036,6 +4401,19 @@ fn save_balance_snapshot(
         .map_err(|_| "数据库正在使用中".to_string())?;
     create_auto_backup(&conn, &state.backup_dir, "pre-reconciliation")?;
     apply_balance_snapshot(&mut conn, &input)
+}
+
+#[tauri::command]
+fn confirm_historical_redemption(
+    input: HistoricalRedemptionInput,
+    state: State<'_, AppState>,
+) -> Result<EntryResult, String> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    create_auto_backup(&conn, &state.backup_dir, "pre-redemption-confirmation")?;
+    apply_historical_redemption_confirmation(&mut conn, &input)
 }
 
 #[tauri::command]
@@ -4475,24 +4853,37 @@ fn get_transaction_detail(
          WHERE t.id = ?1",
         [transaction_id],
         |row| {
+            let operation: String = row.get(4)?;
+            let note: Option<String> = row.get(10)?;
+            let source: String = row.get(11)?;
+            let reversed_by: Option<i64> = row.get(14)?;
+            let can_confirm_historical_redemption = source == "excel"
+                && operation == "REDEEM"
+                && reversed_by.is_none();
+            let needs_review = can_confirm_historical_redemption
+                && note
+                    .as_deref()
+                    .is_some_and(|value| value.contains("待核对"));
             Ok(TransactionDetail {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 code: row.get(2)?,
                 institution: row.get(3)?,
-                operation: row.get(4)?,
+                operation,
                 trade_date: row.get(5)?,
                 amount: row.get(6)?,
                 cost_basis: row.get(7)?,
                 realized_gain: row.get(8)?,
                 currency: row.get(9)?,
-                note: row.get(10)?,
-                source: row.get(11)?,
+                note,
+                source,
                 valuation_before: row.get(12)?,
                 valuation_after: row.get(13)?,
-                reversed_by: row.get(14)?,
+                reversed_by,
                 reversal_of: row.get(15)?,
                 can_reverse,
+                can_confirm_historical_redemption,
+                needs_review,
             })
         },
     )
@@ -4563,6 +4954,7 @@ pub fn run() {
             update_master_data,
             get_reconciliation_center,
             save_balance_snapshot,
+            confirm_historical_redemption,
             get_analytics
         ])
         .run(tauri::generate_context!())
@@ -5244,8 +5636,8 @@ mod tests {
         parse_workbook(&workbook, &mut conn).expect("import workbook");
         let center = reconciliation_center_from_conn(&conn).expect("quality center");
         assert!(center.issue_count > 20);
-        assert!(center.high_priority_count > 0);
-        assert!(center
+        assert_eq!(center.high_priority_count, 0);
+        assert!(!center
             .issues
             .iter()
             .any(|issue| issue.category == "历史流水"));
@@ -5261,5 +5653,159 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.category == "账户对账"));
+    }
+
+    #[test]
+    fn imports_sheet2_historical_redemptions_as_grouped_actual_proceeds() {
+        let workbook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../理财.xlsx");
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        let report = parse_workbook(&workbook, &mut conn).expect("import workbook");
+        let (count, proceeds, cost, gain, pending): (i64, f64, f64, f64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(amount), SUM(cost_basis), SUM(realized_gain),
+                        SUM(CASE WHEN note LIKE '%待核对%' THEN 1 ELSE 0 END)
+                 FROM transactions WHERE transaction_type = 'REDEEM' AND source = 'excel'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("historical redemption totals");
+        assert_eq!(count, 13);
+        assert!((proceeds - 93_867.01).abs() < 0.01);
+        assert!((cost - 93_000.0).abs() < 0.01);
+        assert!((gain - 867.01).abs() < 0.01);
+        assert_eq!(pending, 0);
+        let (af_amount, af_cost): (f64, f64) = conn
+            .query_row(
+                "SELECT t.amount, t.cost_basis FROM transactions t
+                 JOIN products p ON p.id = t.product_id
+                 WHERE t.transaction_type = 'REDEEM' AND p.code = 'AF247644G'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("grouped two-lot redemption");
+        assert!((af_amount - 10_078.0).abs() < 0.01);
+        assert!((af_cost - 10_000.0).abs() < 0.01);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("DT1H2508A") && warning.contains("币种")));
+    }
+
+    #[test]
+    fn historical_redemption_confirmation_updates_returns_and_survives_reimport() {
+        let workbook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../理财.xlsx");
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        parse_workbook(&workbook, &mut conn).expect("first import");
+        let before = reconciliation_center_from_conn(&conn).expect("quality before");
+        let historical_before = before
+            .issues
+            .iter()
+            .filter(|issue| issue.category == "历史流水")
+            .count();
+        assert_eq!(historical_before, 0);
+        let (transaction_id, source_row, original_cost, original_date): (i64, i64, f64, String) =
+            conn.query_row(
+                "SELECT id, source_row, cost_basis, trade_date
+                 FROM transactions WHERE transaction_type = 'REDEEM'
+                   AND source = 'excel' LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("imported historical redemption");
+        let proceeds = original_cost + 123.45;
+        let confirmed_date = NaiveDate::parse_from_str(&original_date, "%Y-%m-%d")
+            .expect("original date")
+            .checked_add_signed(Duration::days(1))
+            .expect("next day")
+            .format("%Y-%m-%d")
+            .to_string();
+        let result = apply_historical_redemption_confirmation(
+            &mut conn,
+            &HistoricalRedemptionInput {
+                transaction_id,
+                trade_date: confirmed_date.clone(),
+                proceeds,
+                note: Some("银行流水已核对".to_string()),
+            },
+        )
+        .expect("confirm redemption");
+        assert!((result.realized_gain.unwrap_or_default() - 123.45).abs() < 0.01);
+        let after = reconciliation_center_from_conn(&conn).expect("quality after");
+        assert_eq!(
+            after
+                .issues
+                .iter()
+                .filter(|issue| issue.category == "历史流水")
+                .count(),
+            historical_before
+        );
+
+        parse_workbook(&workbook, &mut conn).expect("second import");
+        let (date, amount, cost, gain, note): (String, f64, f64, f64, String) = conn
+            .query_row(
+                "SELECT trade_date, amount, cost_basis, realized_gain, note
+                 FROM transactions WHERE transaction_type = 'REDEEM'
+                   AND source = 'excel' AND source_row = ?1",
+                [source_row],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("reimported confirmed redemption");
+        assert_eq!(date, confirmed_date);
+        assert!((amount - proceeds).abs() < 0.01);
+        assert!((cost - original_cost).abs() < 0.01);
+        assert!((gain - 123.45).abs() < 0.01);
+        assert!(note.contains("已核对"));
+        assert!(!note.contains("待核对"));
+        let confirmations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM historical_redemption_confirmations",
+                [],
+                |row| row.get(0),
+            )
+            .expect("confirmation count");
+        assert_eq!(confirmations, 1);
+    }
+
+    #[test]
+    fn migration_backfills_historical_redemption_cost_basis() {
+        let workbook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../理财.xlsx");
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        parse_workbook(&workbook, &mut conn).expect("import workbook");
+        conn.execute(
+            "UPDATE transactions SET cost_basis = 0, realized_gain = 0
+             WHERE transaction_type = 'REDEEM' AND source = 'excel'",
+            [],
+        )
+        .expect("simulate legacy redemption data");
+        migrate(&conn).expect("rerun migration");
+        let missing_cost: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions
+                 WHERE transaction_type = 'REDEEM' AND source = 'excel'
+                   AND cost_basis <= 0.000001",
+                [],
+                |row| row.get(0),
+            )
+            .expect("missing cost count");
+        assert_eq!(missing_cost, 0);
     }
 }

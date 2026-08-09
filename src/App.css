@@ -194,7 +194,20 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
 .detail-grid dt { color: #748179; font-size: 10px; margin-bottom: 4px; }
 .detail-grid dd { margin: 0; font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .detail-note { grid-column: 1 / -1; }
+.warning-note { display: flex; align-items: flex-start; gap: 7px; background: #fff2e2; color: #7e592c; }
+.warning-note svg { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 1px; }
 .detail-modal > .entry-actions { margin-top: 15px; }
+.redemption-modal { width: min(650px, 100%); }
+.redemption-context { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 18px 0; }
+.redemption-context > div { padding: 10px 11px; border: 1px solid #e1e7e2; border-radius: 9px; display: grid; gap: 4px; }
+.redemption-context span { color: #748179; font-size: 9px; }
+.redemption-context strong { font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.redemption-result { padding: 11px 12px; border-radius: 9px; background: #f0f5f1; display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; }
+.redemption-result span { color: #647168; font-size: 10px; }
+.redemption-result strong { font-size: 15px; font-variant-numeric: tabular-nums; }
+.redemption-result small { grid-column: 1 / -1; color: #748179; font-size: 9px; }
+.redemption-result.gain { background: #e8f4eb; }
+.redemption-result.loss { background: #faece9; }
 .analysis-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .analysis-toolbar > span { color: #728078; font-size: 11px; }
 .analysis-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -312,6 +325,7 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
   .search-field { grid-column: 1 / -1; }
   .reconciliation-metrics { grid-template-columns: 1fr 1fr; }
   .reconciliation-metrics .metric-card:last-child { grid-column: auto; }
+  .redemption-context { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 680px) {
