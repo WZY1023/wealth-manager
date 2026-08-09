@@ -24,6 +24,7 @@ struct CurrencySummary {
     currency: String,
     wealth_value: f64,
     deposit_value: f64,
+    demand_value: f64,
     total_value: f64,
     invested_cost: f64,
     unrealized_gain: f64,
@@ -35,6 +36,8 @@ struct Dashboard {
     as_of_date: String,
     last_import_at: Option<String>,
     currencies: Vec<CurrencySummary>,
+    converted_total_cny: f64,
+    has_estimated_exchange_rate: bool,
     holding_count: i64,
     warning_count: i64,
 }
@@ -161,27 +164,38 @@ struct AccountRecord {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AccountReconciliation {
-    account_id: i64,
+struct InstitutionReconciliation {
     institution: String,
-    name: String,
-    currency: String,
-    wealth_value: f64,
-    deposit_value: f64,
-    tracked_total: f64,
-    actual_balance: Option<f64>,
+    cny_wealth_value: f64,
+    usd_wealth_value: f64,
+    cny_deposit_value: f64,
+    usd_deposit_value: f64,
+    usd_cny_rate: f64,
+    tracked_wealth_cny: f64,
+    tracked_deposit_cny: f64,
+    demand_cny: f64,
+    tracked_total_cny: f64,
+    actual_wealth_cny: Option<f64>,
+    actual_deposit_cny: Option<f64>,
+    actual_total_cny: Option<f64>,
+    wealth_difference: Option<f64>,
+    deposit_difference: Option<f64>,
     difference: Option<f64>,
     balance_date: Option<String>,
     note: Option<String>,
+    has_usd_assets: bool,
     status: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BalanceSnapshotInput {
-    account_id: i64,
+struct InstitutionSnapshotInput {
+    institution: String,
     balance_date: String,
-    actual_balance: f64,
+    usd_cny_rate: f64,
+    actual_wealth_cny: f64,
+    actual_deposit_cny: f64,
+    demand_cny: f64,
     note: Option<String>,
 }
 
@@ -218,7 +232,7 @@ struct QualityIssue {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReconciliationCenter {
-    accounts: Vec<AccountReconciliation>,
+    institutions: Vec<InstitutionReconciliation>,
     issues: Vec<QualityIssue>,
     issue_count: usize,
     high_priority_count: usize,
@@ -591,6 +605,19 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           created_at TEXT NOT NULL,
           FOREIGN KEY(account_id) REFERENCES accounts(id),
           UNIQUE(account_id, balance_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS institution_reconciliation_snapshots (
+          id INTEGER PRIMARY KEY,
+          institution TEXT NOT NULL,
+          balance_date TEXT NOT NULL,
+          usd_cny_rate REAL NOT NULL,
+          actual_wealth_cny REAL NOT NULL,
+          actual_deposit_cny REAL NOT NULL,
+          demand_cny REAL NOT NULL,
+          note TEXT,
+          created_at TEXT NOT NULL,
+          UNIQUE(institution, balance_date)
         );
 
         CREATE TABLE IF NOT EXISTS historical_redemption_confirmations (
@@ -3569,54 +3596,106 @@ fn list_master_data_from_conn(conn: &Connection) -> Result<MasterData, String> {
 }
 
 fn reconciliation_center_from_conn(conn: &Connection) -> Result<ReconciliationCenter, String> {
-    let accounts = {
+    let latest_recorded_rate: f64 = conn
+        .query_row(
+            "SELECT usd_cny_rate FROM institution_reconciliation_snapshots
+             ORDER BY balance_date DESC, id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(7.0);
+    let institutions = {
         let mut statement = conn
             .prepare(
-                "SELECT a.id, a.institution, a.name, a.currency,
+                "SELECT banks.institution,
                         COALESCE((
                           SELECT SUM(v.market_value) FROM valuations v
-                          WHERE v.account_id = a.id AND v.is_current = 1
+                          JOIN accounts a ON a.id = v.account_id
+                          WHERE a.institution = banks.institution AND a.currency = 'CNY'
+                            AND v.is_current = 1
+                        ), 0),
+                        COALESCE((
+                          SELECT SUM(v.market_value) FROM valuations v
+                          JOIN accounts a ON a.id = v.account_id
+                          WHERE a.institution = banks.institution AND a.currency = 'USD'
+                            AND v.is_current = 1
                         ), 0),
                         COALESCE((
                           SELECT SUM(d.principal) FROM deposits d
-                          WHERE d.account_id = a.id AND d.status = 'active'
+                          JOIN accounts a ON a.id = d.account_id
+                          WHERE a.institution = banks.institution AND a.currency = 'CNY'
+                            AND d.status = 'active'
                         ), 0),
-                        s.actual_balance, s.balance_date, s.note
-                 FROM accounts a
-                 LEFT JOIN account_balance_snapshots s ON s.id = (
-                   SELECT s2.id FROM account_balance_snapshots s2
-                   WHERE s2.account_id = a.id
+                        COALESCE((
+                          SELECT SUM(d.principal) FROM deposits d
+                          JOIN accounts a ON a.id = d.account_id
+                          WHERE a.institution = banks.institution AND a.currency = 'USD'
+                            AND d.status = 'active'
+                        ), 0),
+                        s.usd_cny_rate, s.actual_wealth_cny,
+                        s.actual_deposit_cny, s.demand_cny,
+                        s.balance_date, s.note
+                 FROM (SELECT DISTINCT institution FROM accounts) banks
+                 LEFT JOIN institution_reconciliation_snapshots s ON s.id = (
+                   SELECT s2.id FROM institution_reconciliation_snapshots s2
+                   WHERE s2.institution = banks.institution
                    ORDER BY s2.balance_date DESC, s2.id DESC LIMIT 1
                  )
-                 ORDER BY a.currency, a.institution, a.name",
+                 ORDER BY banks.institution",
             )
             .map_err(|error| error.to_string())?;
         let records = statement
             .query_map([], |row| {
-                let wealth_value: f64 = row.get(4)?;
-                let deposit_value: f64 = row.get(5)?;
-                let tracked_total = wealth_value + deposit_value;
-                let actual_balance: Option<f64> = row.get(6)?;
-                let difference = actual_balance.map(|value| value - tracked_total);
-                let currency: String = row.get(3)?;
-                let tolerance = if currency == "USD" { 0.01 } else { 1.0 };
-                let status = match difference {
-                    None => "missing",
-                    Some(value) if value.abs() <= tolerance => "matched",
-                    Some(_) => "difference",
+                let cny_wealth_value: f64 = row.get(1)?;
+                let usd_wealth_value: f64 = row.get(2)?;
+                let cny_deposit_value: f64 = row.get(3)?;
+                let usd_deposit_value: f64 = row.get(4)?;
+                let recorded_rate: Option<f64> = row.get(5)?;
+                let usd_cny_rate = recorded_rate.unwrap_or(latest_recorded_rate);
+                let tracked_wealth_cny = cny_wealth_value + usd_wealth_value * usd_cny_rate;
+                let tracked_deposit_cny = cny_deposit_value + usd_deposit_value * usd_cny_rate;
+                let actual_wealth_cny: Option<f64> = row.get(6)?;
+                let actual_deposit_cny: Option<f64> = row.get(7)?;
+                let demand_cny = row.get::<_, Option<f64>>(8)?.unwrap_or_default();
+                let actual_total_cny = actual_wealth_cny
+                    .zip(actual_deposit_cny)
+                    .map(|(wealth, deposit)| wealth + deposit + demand_cny);
+                let tracked_total_cny = tracked_wealth_cny + tracked_deposit_cny + demand_cny;
+                let wealth_difference = actual_wealth_cny.map(|value| value - tracked_wealth_cny);
+                let deposit_difference =
+                    actual_deposit_cny.map(|value| value - tracked_deposit_cny);
+                let difference = actual_total_cny.map(|value| value - tracked_total_cny);
+                let status = match (wealth_difference, deposit_difference) {
+                    (Some(wealth), Some(deposit))
+                        if wealth.abs() <= 1.0 && deposit.abs() <= 1.0 =>
+                    {
+                        "matched"
+                    }
+                    (Some(_), Some(_)) => "difference",
+                    _ => "missing",
                 };
-                Ok(AccountReconciliation {
-                    account_id: row.get(0)?,
-                    institution: row.get(1)?,
-                    name: row.get(2)?,
-                    currency,
-                    wealth_value,
-                    deposit_value,
-                    tracked_total,
-                    actual_balance,
+                Ok(InstitutionReconciliation {
+                    institution: row.get(0)?,
+                    cny_wealth_value,
+                    usd_wealth_value,
+                    cny_deposit_value,
+                    usd_deposit_value,
+                    usd_cny_rate,
+                    tracked_wealth_cny,
+                    tracked_deposit_cny,
+                    demand_cny,
+                    tracked_total_cny,
+                    actual_wealth_cny,
+                    actual_deposit_cny,
+                    actual_total_cny,
+                    wealth_difference,
+                    deposit_difference,
                     difference,
-                    balance_date: row.get(7)?,
-                    note: row.get(8)?,
+                    balance_date: row.get(9)?,
+                    note: row.get(10)?,
+                    has_usd_assets: usd_wealth_value > 0.000_001 || usd_deposit_value > 0.000_001,
                     status: status.to_string(),
                 })
             })
@@ -3627,35 +3706,35 @@ fn reconciliation_center_from_conn(conn: &Connection) -> Result<ReconciliationCe
     };
 
     let mut issues = Vec::new();
-    for account in &accounts {
-        if account.tracked_total <= 0.000_001 && account.actual_balance.is_none() {
+    for institution in &institutions {
+        if institution.tracked_total_cny <= 0.000_001 && institution.actual_total_cny.is_none() {
             continue;
         }
-        match account.status.as_str() {
+        match institution.status.as_str() {
             "missing" => issues.push(QualityIssue {
-                key: format!("reconciliation-missing-{}", account.account_id),
+                key: format!("reconciliation-missing-{}", institution.institution),
                 severity: "medium".to_string(),
-                category: "账户对账".to_string(),
-                title: format!("{} 尚未核对", account.institution),
+                category: "银行对账".to_string(),
+                title: format!("{} 尚未核对", institution.institution),
                 detail: format!(
-                    "账本记录 {} 资产 {:.2} {}，请录入银行页面显示的账户总资产",
-                    account.name, account.tracked_total, account.currency
+                    "软件折算资产 {:.2} 元，请录入银行 App 的理财、存款和活期三个人民币分项",
+                    institution.tracked_total_cny
                 ),
                 target_view: "reconciliation".to_string(),
-                target_id: Some(account.account_id),
+                target_id: None,
             }),
             "difference" => issues.push(QualityIssue {
-                key: format!("reconciliation-difference-{}", account.account_id),
+                key: format!("reconciliation-difference-{}", institution.institution),
                 severity: "high".to_string(),
-                category: "账户对账".to_string(),
-                title: format!("{} 存在对账差额", account.institution),
+                category: "银行对账".to_string(),
+                title: format!("{} 存在对账差额", institution.institution),
                 detail: format!(
-                    "银行余额与账本相差 {:+.2} {}，请检查现金、漏记产品或入账时差",
-                    account.difference.unwrap_or_default(),
-                    account.currency
+                    "理财相差 {:+.2} 元，存款相差 {:+.2} 元；请检查汇率、漏记产品或入账时差",
+                    institution.wealth_difference.unwrap_or_default(),
+                    institution.deposit_difference.unwrap_or_default()
                 ),
                 target_view: "reconciliation".to_string(),
-                target_id: Some(account.account_id),
+                target_id: None,
             }),
             _ => {}
         }
@@ -3843,50 +3922,71 @@ fn reconciliation_center_from_conn(conn: &Connection) -> Result<ReconciliationCe
         .filter(|issue| issue.severity == "high")
         .count();
     Ok(ReconciliationCenter {
-        accounts,
+        institutions,
         issue_count: issues.len(),
         high_priority_count,
         issues,
     })
 }
 
-fn apply_balance_snapshot(
+fn apply_institution_snapshot(
     conn: &mut Connection,
-    input: &BalanceSnapshotInput,
+    input: &InstitutionSnapshotInput,
 ) -> Result<EntryResult, String> {
     let balance_date = valid_date(&input.balance_date, "对账日期")?;
-    if !input.actual_balance.is_finite() || input.actual_balance < 0.0 {
-        return Err("银行显示总资产必须是大于或等于0的有效数字".to_string());
+    let institution = input.institution.trim();
+    if institution.is_empty() {
+        return Err("银行名称不能为空".to_string());
+    }
+    for (label, value) in [
+        ("美元兑人民币汇率", input.usd_cny_rate),
+        ("银行理财", input.actual_wealth_cny),
+        ("银行存款", input.actual_deposit_cny),
+        ("银行活期", input.demand_cny),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!("{label}必须是大于或等于0的有效数字"));
+        }
+    }
+    if input.usd_cny_rate <= 0.0 {
+        return Err("美元兑人民币汇率必须大于0".to_string());
     }
     let exists: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
-            [input.account_id],
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE institution = ?1)",
+            [institution],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
     if !exists {
-        return Err("没有找到所选账户".to_string());
+        return Err("没有找到所选银行".to_string());
     }
     conn.execute(
-        "INSERT INTO account_balance_snapshots
-           (account_id, balance_date, actual_balance, note, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(account_id, balance_date) DO UPDATE SET
-           actual_balance = excluded.actual_balance,
+        "INSERT INTO institution_reconciliation_snapshots
+           (institution, balance_date, usd_cny_rate, actual_wealth_cny,
+            actual_deposit_cny, demand_cny, note, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(institution, balance_date) DO UPDATE SET
+           usd_cny_rate = excluded.usd_cny_rate,
+           actual_wealth_cny = excluded.actual_wealth_cny,
+           actual_deposit_cny = excluded.actual_deposit_cny,
+           demand_cny = excluded.demand_cny,
            note = excluded.note,
            created_at = excluded.created_at",
         params![
-            input.account_id,
+            institution,
             balance_date,
-            input.actual_balance,
+            input.usd_cny_rate,
+            input.actual_wealth_cny,
+            input.actual_deposit_cny,
+            input.demand_cny,
             input.note,
             Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
         ],
     )
     .map_err(|error| error.to_string())?;
     Ok(EntryResult {
-        message: "账户余额已核对，差额和数据质量清单已更新".to_string(),
+        message: "银行分项已核对，活期资产、折算资产和数据质量清单已更新".to_string(),
         realized_gain: None,
     })
 }
@@ -5093,8 +5193,8 @@ fn get_reconciliation_center(state: State<'_, AppState>) -> Result<Reconciliatio
 }
 
 #[tauri::command]
-fn save_balance_snapshot(
-    input: BalanceSnapshotInput,
+fn save_institution_snapshot(
+    input: InstitutionSnapshotInput,
     state: State<'_, AppState>,
 ) -> Result<EntryResult, String> {
     let mut conn = state
@@ -5102,7 +5202,7 @@ fn save_balance_snapshot(
         .lock()
         .map_err(|_| "数据库正在使用中".to_string())?;
     create_auto_backup(&conn, &state.backup_dir, "pre-reconciliation")?;
-    apply_balance_snapshot(&mut conn, &input)
+    apply_institution_snapshot(&mut conn, &input)
 }
 
 #[tauri::command]
@@ -5135,6 +5235,24 @@ fn get_analytics(state: State<'_, AppState>) -> Result<Analytics, String> {
     })
 }
 
+fn latest_demand_value_from_conn(conn: &Connection) -> Result<f64, String> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(s.demand_cny), 0)
+         FROM institution_reconciliation_snapshots s
+         WHERE s.id = (
+           SELECT s2.id FROM institution_reconciliation_snapshots s2
+           WHERE s2.institution = s.institution
+           ORDER BY s2.balance_date DESC, s2.id DESC LIMIT 1
+         )
+           AND EXISTS (
+             SELECT 1 FROM accounts a WHERE a.institution = s.institution
+           )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn get_dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
     let conn = state
@@ -5165,15 +5283,79 @@ fn get_dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
+        let demand_value: f64 = if currency == "CNY" {
+            latest_demand_value_from_conn(&conn)?
+        } else {
+            0.0
+        };
         currencies.push(CurrencySummary {
             currency: currency.to_string(),
             wealth_value,
             deposit_value,
-            total_value: wealth_value + deposit_value,
+            demand_value,
+            total_value: wealth_value + deposit_value + demand_value,
             invested_cost,
             unrealized_gain: wealth_value - invested_cost,
         });
     }
+    let fallback_rate: f64 = conn
+        .query_row(
+            "SELECT usd_cny_rate FROM institution_reconciliation_snapshots
+             ORDER BY balance_date DESC, id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(7.0);
+    let converted_wealth_cny: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(v.market_value * CASE WHEN a.currency = 'USD' THEN
+               COALESCE((
+                 SELECT s.usd_cny_rate FROM institution_reconciliation_snapshots s
+                 WHERE s.institution = a.institution
+                 ORDER BY s.balance_date DESC, s.id DESC LIMIT 1
+               ), ?1) ELSE 1 END), 0)
+             FROM valuations v JOIN accounts a ON a.id = v.account_id
+             WHERE v.is_current = 1",
+            [fallback_rate],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let converted_deposit_cny: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(d.principal * CASE WHEN a.currency = 'USD' THEN
+               COALESCE((
+                 SELECT s.usd_cny_rate FROM institution_reconciliation_snapshots s
+                 WHERE s.institution = a.institution
+                 ORDER BY s.balance_date DESC, s.id DESC LIMIT 1
+               ), ?1) ELSE 1 END), 0)
+             FROM deposits d JOIN accounts a ON a.id = d.account_id
+             WHERE d.status = 'active'",
+            [fallback_rate],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let has_estimated_exchange_rate: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM accounts a
+               WHERE a.currency = 'USD'
+                 AND (
+                   EXISTS(SELECT 1 FROM valuations v WHERE v.account_id = a.id AND v.is_current = 1 AND v.market_value > 0.000001)
+                   OR EXISTS(SELECT 1 FROM deposits d WHERE d.account_id = a.id AND d.status = 'active' AND d.principal > 0.000001)
+                 )
+                 AND NOT EXISTS(
+                   SELECT 1 FROM institution_reconciliation_snapshots s
+                   WHERE s.institution = a.institution
+                 )
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let converted_total_cny =
+        converted_wealth_cny + converted_deposit_cny + latest_demand_value_from_conn(&conn)?;
     let holding_count = conn
         .query_row(
             "SELECT COUNT(*) FROM valuations WHERE is_current = 1 AND market_value > 0.000001",
@@ -5198,6 +5380,8 @@ fn get_dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
         as_of_date: Local::now().format("%Y-%m-%d").to_string(),
         last_import_at: last_run.map(|(date, _)| date),
         currencies,
+        converted_total_cny,
+        has_estimated_exchange_rate,
         holding_count,
         warning_count,
     })
@@ -5672,7 +5856,7 @@ pub fn run() {
             list_master_data,
             update_master_data,
             get_reconciliation_center,
-            save_balance_snapshot,
+            save_institution_snapshot,
             confirm_historical_redemption,
             get_analytics
         ])
@@ -6636,57 +6820,93 @@ mod tests {
     }
 
     #[test]
-    fn account_reconciliation_records_snapshots_and_detects_differences() {
+    fn bank_reconciliation_records_components_and_detects_differences() {
         let mut conn = Connection::open_in_memory().expect("open memory db");
         migrate(&conn).expect("migrate");
         apply_entry(&mut conn, &entry("BUY", 10_000.0)).expect("buy");
         let initial = reconciliation_center_from_conn(&conn).expect("initial center");
-        let account = initial
-            .accounts
+        let bank = initial
+            .institutions
             .iter()
-            .find(|item| item.tracked_total > 0.0)
-            .expect("tracked account");
-        assert_eq!(account.status, "missing");
-        let account_id = account.account_id;
-        let tracked_total = account.tracked_total;
-        let input = BalanceSnapshotInput {
-            account_id,
+            .find(|item| item.institution == "测试银行")
+            .expect("tracked bank");
+        assert_eq!(bank.status, "missing");
+        let tracked_wealth = bank.tracked_wealth_cny;
+        let input = InstitutionSnapshotInput {
+            institution: "测试银行".to_string(),
             balance_date: "2026-08-09".to_string(),
-            actual_balance: tracked_total,
+            usd_cny_rate: 7.2,
+            actual_wealth_cny: tracked_wealth,
+            actual_deposit_cny: 0.0,
+            demand_cny: 800.0,
             note: Some("首次核对".to_string()),
         };
-        apply_balance_snapshot(&mut conn, &input).expect("matched snapshot");
+        apply_institution_snapshot(&mut conn, &input).expect("matched snapshot");
         let matched = reconciliation_center_from_conn(&conn).expect("matched center");
-        assert_eq!(
-            matched
-                .accounts
-                .iter()
-                .find(|item| item.account_id == account_id)
-                .expect("matched account")
-                .status,
-            "matched"
-        );
-        let changed = BalanceSnapshotInput {
-            actual_balance: tracked_total + 88.0,
+        let bank = matched
+            .institutions
+            .iter()
+            .find(|item| item.institution == "测试银行")
+            .expect("matched bank");
+        assert_eq!(bank.status, "matched");
+        assert!((bank.demand_cny - 800.0).abs() < 0.01);
+        assert!((bank.tracked_total_cny - (tracked_wealth + 800.0)).abs() < 0.01);
+        let changed = InstitutionSnapshotInput {
+            actual_wealth_cny: tracked_wealth + 88.0,
             ..input
         };
-        apply_balance_snapshot(&mut conn, &changed).expect("updated snapshot");
+        apply_institution_snapshot(&mut conn, &changed).expect("updated snapshot");
         let different = reconciliation_center_from_conn(&conn).expect("different center");
-        let account = different
-            .accounts
+        let bank = different
+            .institutions
             .iter()
-            .find(|item| item.account_id == account_id)
-            .expect("different account");
-        assert_eq!(account.status, "difference");
-        assert!((account.difference.unwrap_or_default() - 88.0).abs() < 0.01);
+            .find(|item| item.institution == "测试银行")
+            .expect("different bank");
+        assert_eq!(bank.status, "difference");
+        assert!((bank.wealth_difference.unwrap_or_default() - 88.0).abs() < 0.01);
         let snapshots: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM account_balance_snapshots",
+                "SELECT COUNT(*) FROM institution_reconciliation_snapshots",
                 [],
                 |row| row.get(0),
             )
             .expect("snapshot count");
         assert_eq!(snapshots, 1);
+        assert!(
+            (latest_demand_value_from_conn(&conn).expect("latest demand") - 800.0).abs() < 0.01
+        );
+    }
+
+    #[test]
+    fn bank_reconciliation_merges_cny_and_usd_assets_with_one_rate() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        apply_entry(&mut conn, &entry("BUY", 10_000.0)).expect("cny buy");
+        let mut usd_entry = entry("BUY", 1_000.0);
+        usd_entry.currency = Some("USD".to_string());
+        usd_entry.product_code = Some("TESTUSD".to_string());
+        usd_entry.product_name = Some("测试美元理财".to_string());
+        apply_entry(&mut conn, &usd_entry).expect("usd buy");
+
+        let input = InstitutionSnapshotInput {
+            institution: "测试银行".to_string(),
+            balance_date: "2026-08-09".to_string(),
+            usd_cny_rate: 7.2,
+            actual_wealth_cny: 17_200.0,
+            actual_deposit_cny: 0.0,
+            demand_cny: 500.0,
+            note: None,
+        };
+        apply_institution_snapshot(&mut conn, &input).expect("save bank snapshot");
+        let center = reconciliation_center_from_conn(&conn).expect("reconciliation center");
+        assert_eq!(center.institutions.len(), 1);
+        let bank = &center.institutions[0];
+        assert!(bank.has_usd_assets);
+        assert!((bank.cny_wealth_value - 10_000.0).abs() < 0.01);
+        assert!((bank.usd_wealth_value - 1_000.0).abs() < 0.01);
+        assert!((bank.tracked_wealth_cny - 17_200.0).abs() < 0.01);
+        assert!((bank.tracked_total_cny - 17_700.0).abs() < 0.01);
+        assert_eq!(bank.status, "matched");
     }
 
     #[test]
@@ -6713,7 +6933,7 @@ mod tests {
         assert!(center
             .issues
             .iter()
-            .any(|issue| issue.category == "账户对账"));
+            .any(|issue| issue.category == "银行对账"));
     }
 
     #[test]

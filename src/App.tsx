@@ -42,6 +42,7 @@ type CurrencySummary = {
   currency: CurrencyCode;
   wealthValue: number;
   depositValue: number;
+  demandValue: number;
   totalValue: number;
   investedCost: number;
   unrealizedGain: number;
@@ -51,6 +52,8 @@ type Dashboard = {
   asOfDate: string;
   lastImportAt: string | null;
   currencies: CurrencySummary[];
+  convertedTotalCny: number;
+  hasEstimatedExchangeRate: boolean;
   holdingCount: number;
   warningCount: number;
 };
@@ -134,10 +137,10 @@ type EntryInput = {
 type EntryResult = { message: string; realizedGain: number | null };
 type FileOperationResult = { path: string; message: string };
 
-type AccountReconciliation = { accountId: number; institution: string; name: string; currency: CurrencyCode; wealthValue: number; depositValue: number; trackedTotal: number; actualBalance: number | null; difference: number | null; balanceDate: string | null; note: string | null; status: "missing" | "matched" | "difference" };
+type InstitutionReconciliation = { institution: string; cnyWealthValue: number; usdWealthValue: number; cnyDepositValue: number; usdDepositValue: number; usdCnyRate: number; trackedWealthCny: number; trackedDepositCny: number; demandCny: number; trackedTotalCny: number; actualWealthCny: number | null; actualDepositCny: number | null; actualTotalCny: number | null; wealthDifference: number | null; depositDifference: number | null; difference: number | null; balanceDate: string | null; note: string | null; hasUsdAssets: boolean; status: "missing" | "matched" | "difference" };
 type QualityIssue = { key: string; severity: "high" | "medium" | "low"; category: string; title: string; detail: string; targetView: View; targetId: number | null };
-type ReconciliationCenter = { accounts: AccountReconciliation[]; issues: QualityIssue[]; issueCount: number; highPriorityCount: number };
-type BalanceSnapshotInput = { accountId: number; balanceDate: string; actualBalance: number; note: string | null };
+type ReconciliationCenter = { institutions: InstitutionReconciliation[]; issues: QualityIssue[]; issueCount: number; highPriorityCount: number };
+type InstitutionSnapshotInput = { institution: string; balanceDate: string; usdCnyRate: number; actualWealthCny: number; actualDepositCny: number; demandCny: number; note: string | null };
 
 type AccountRecord = { id: number; institution: string; name: string; currency: CurrencyCode; source: string };
 type ProductRecord = { id: number; code: string; name: string; currency: CurrencyCode; issuer: string | null; purchaseBanks: string[]; riskLevel: string | null; source: string };
@@ -188,16 +191,18 @@ const EMPTY_DASHBOARD: Dashboard = {
   asOfDate: new Date().toISOString().slice(0, 10),
   lastImportAt: null,
   currencies: [
-    { currency: "CNY", wealthValue: 0, depositValue: 0, totalValue: 0, investedCost: 0, unrealizedGain: 0 },
-    { currency: "USD", wealthValue: 0, depositValue: 0, totalValue: 0, investedCost: 0, unrealizedGain: 0 },
+    { currency: "CNY", wealthValue: 0, depositValue: 0, demandValue: 0, totalValue: 0, investedCost: 0, unrealizedGain: 0 },
+    { currency: "USD", wealthValue: 0, depositValue: 0, demandValue: 0, totalValue: 0, investedCost: 0, unrealizedGain: 0 },
   ],
+  convertedTotalCny: 0,
+  hasEstimatedExchangeRate: false,
   holdingCount: 0,
   warningCount: 0,
 };
 
 const EMPTY_MASTER_DATA: MasterData = { accounts: [], products: [], deposits: [] };
 const EMPTY_ANALYTICS: Analytics = { asOfDate: new Date().toISOString().slice(0, 10), currencies: [] };
-const EMPTY_RECONCILIATION: ReconciliationCenter = { accounts: [], issues: [], issueCount: 0, highPriorityCount: 0 };
+const EMPTY_RECONCILIATION: ReconciliationCenter = { institutions: [], issues: [], issueCount: 0, highPriorityCount: 0 };
 
 const viewTitles: Record<View, string> = {
   overview: "资产总览",
@@ -292,7 +297,7 @@ function App() {
   const [editingRecord, setEditingRecord] = useState<EditableRecord | null>(null);
   const [holdingDetail, setHoldingDetail] = useState<HoldingDetail | null>(null);
   const [holdingDetailLoading, setHoldingDetailLoading] = useState(false);
-  const [reconcilingAccount, setReconcilingAccount] = useState<AccountReconciliation | null>(null);
+  const [reconcilingInstitution, setReconcilingInstitution] = useState<InstitutionReconciliation | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -519,13 +524,13 @@ function App() {
     }
   };
 
-  const saveBalanceSnapshot = async (input: BalanceSnapshotInput) => {
+  const saveInstitutionSnapshot = async (input: InstitutionSnapshotInput) => {
     setError(null);
     setLoading(true);
     try {
-      const result = await invoke<EntryResult>("save_balance_snapshot", { input });
+      const result = await invoke<EntryResult>("save_institution_snapshot", { input });
       setNotice(result.message);
-      setReconcilingAccount(null);
+      setReconcilingInstitution(null);
       await refresh();
     } catch (reason) {
       setError(String(reason));
@@ -625,7 +630,7 @@ function App() {
             {view === "calendar" && <CalendarView groups={groupedMaturities} />}
             {view === "analytics" && <AnalyticsView analytics={analytics} currency={currency} onCurrencyChange={setCurrency} />}
             {view === "masterData" && <MasterDataView data={masterData} onEdit={setEditingRecord} />}
-            {view === "reconciliation" && <ReconciliationView data={reconciliation} onReconcile={setReconcilingAccount} onOpenIssue={openQualityIssue} />}
+            {view === "reconciliation" && <ReconciliationView data={reconciliation} onReconcile={setReconcilingInstitution} onOpenIssue={openQualityIssue} />}
           </>
         )}
       </main>
@@ -694,8 +699,8 @@ function App() {
       {holdingDetail && (
         <HoldingDetailModal detail={holdingDetail} onClose={() => setHoldingDetail(null)} />
       )}
-      {reconcilingAccount && (
-        <BalanceReconciliationModal account={reconcilingAccount} onClose={() => setReconcilingAccount(null)} onSave={saveBalanceSnapshot} />
+      {reconcilingInstitution && (
+        <InstitutionReconciliationModal institution={reconcilingInstitution} onClose={() => setReconcilingInstitution(null)} onSave={saveInstitutionSnapshot} />
       )}
     </div>
   );
@@ -729,11 +734,13 @@ function Overview({ dashboard, currency, onCurrencyChange, selectedSummary, upco
   const allocations = [
     { label: "定期存款", value: selectedSummary.depositValue },
     { label: "银行理财", value: selectedSummary.wealthValue },
+    ...(selectedSummary.demandValue > 0 ? [{ label: "活期", value: selectedSummary.demandValue }] : []),
   ];
   return (
     <>
-      <section className="metrics-grid">
-        <Metric label="人民币资产" value={formatMoney(cny.totalValue, "CNY")} detail={`理财 ${formatMoney(cny.wealthValue, "CNY")} · 存款 ${formatMoney(cny.depositValue, "CNY")}`} />
+      <section className="metrics-grid overview-metrics">
+        <Metric label="折算人民币总资产" value={formatMoney(dashboard.convertedTotalCny, "CNY")} detail={dashboard.hasEstimatedExchangeRate ? "含活期；未核对银行的美元资产按参考汇率暂估" : "含人民币资产、美元折算资产和活期"} />
+        <Metric label="人民币资产" value={formatMoney(cny.totalValue, "CNY")} detail={`理财 ${formatMoney(cny.wealthValue, "CNY")} · 存款 ${formatMoney(cny.depositValue, "CNY")} · 活期 ${formatMoney(cny.demandValue, "CNY")}`} />
         <Metric label="美元资产" value={formatMoney(usd.totalValue, "USD")} detail={`理财 ${formatMoney(usd.wealthValue, "USD")} · 存款 ${formatMoney(usd.depositValue, "USD")}`} />
         <Metric label="当前持仓收益" value={`${formatMoney(cny.unrealizedGain, "CNY")} / ${formatMoney(usd.unrealizedGain, "USD")}`} detail="未包含汇率变动" positive={cny.unrealizedGain + usd.unrealizedGain >= 0} />
       </section>
@@ -965,42 +972,54 @@ function MasterDataView({ data, onEdit }: { data: MasterData; onEdit: (target: E
   );
 }
 
-function ReconciliationView({ data, onReconcile, onOpenIssue }: { data: ReconciliationCenter; onReconcile: (account: AccountReconciliation) => void; onOpenIssue: (issue: QualityIssue) => void }) {
-  const [section, setSection] = useState<"accounts" | "quality">("accounts");
+function ReconciliationView({ data, onReconcile, onOpenIssue }: { data: ReconciliationCenter; onReconcile: (institution: InstitutionReconciliation) => void; onOpenIssue: (issue: QualityIssue) => void }) {
+  const [section, setSection] = useState<"banks" | "quality">("banks");
   const [severity, setSeverity] = useState("all");
   const [searchText, setSearchText] = useState("");
-  const matched = data.accounts.filter((item) => item.status === "matched").length;
-  const differences = data.accounts.filter((item) => item.status === "difference").length;
-  const missing = data.accounts.filter((item) => item.status === "missing" && item.trackedTotal > 0.000001).length;
+  const matched = data.institutions.filter((item) => item.status === "matched").length;
+  const differences = data.institutions.filter((item) => item.status === "difference").length;
+  const missing = data.institutions.filter((item) => item.status === "missing" && item.trackedTotalCny > 0.000001).length;
   const filteredIssues = data.issues.filter((issue) => {
     const keyword = searchText.trim().toLowerCase();
     return (severity === "all" || issue.severity === severity) && (!keyword || `${issue.category} ${issue.title} ${issue.detail}`.toLowerCase().includes(keyword));
   });
   return (
     <>
-      <section className="metrics-grid reconciliation-metrics"><Metric label="已核对账户" value={`${matched}`} detail={`共 ${data.accounts.length} 个账户`} positive={matched > 0} /><Metric label="存在差额" value={`${differences}`} detail="银行总资产与账本不一致" positive={differences === 0} /><Metric label="尚未核对" value={`${missing}`} detail="有账本资产但没有余额快照" positive={missing === 0} /><Metric label="数据质量问题" value={`${data.issueCount}`} detail={`${data.highPriorityCount} 项高优先级`} positive={data.highPriorityCount === 0} /></section>
+      <section className="metrics-grid reconciliation-metrics"><Metric label="已核对银行" value={`${matched}`} detail={`共 ${data.institutions.length} 家银行`} positive={matched > 0} /><Metric label="存在差额" value={`${differences}`} detail="理财或存款分项与软件不一致" positive={differences === 0} /><Metric label="尚未核对" value={`${missing}`} detail="有资产但没有银行分项快照" positive={missing === 0} /><Metric label="数据质量问题" value={`${data.issueCount}`} detail={`${data.highPriorityCount} 项高优先级`} positive={data.highPriorityCount === 0} /></section>
       <article className="panel reconciliation-panel">
-        <div className="panel-header"><div><h2>对账与数据质量</h2><span>银行显示总资产 − 软件中的理财市值与有效定存本金 = 对账差额</span></div><div className="segmented"><button className={section === "accounts" ? "active" : ""} onClick={() => setSection("accounts")}>账户对账</button><button className={section === "quality" ? "active" : ""} onClick={() => setSection("quality")}>问题清单 {data.issueCount}</button></div></div>
-        {section === "accounts" && <div className="table-scroll"><table className="reconciliation-table"><thead><tr><th>账户</th><th>币种</th><th className="number">理财市值</th><th className="number">定存本金</th><th className="number">账本资产</th><th className="number">银行总资产</th><th className="number">差额</th><th>状态</th><th /></tr></thead><tbody>{data.accounts.map((item) => <tr key={item.accountId}><td><strong>{item.institution}</strong><span>{item.name}{item.balanceDate ? ` · 核对于 ${item.balanceDate}` : ""}</span></td><td>{item.currency}</td><td className="number">{formatMoney(item.wealthValue, item.currency)}</td><td className="number">{formatMoney(item.depositValue, item.currency)}</td><td className="number"><strong>{formatMoney(item.trackedTotal, item.currency)}</strong></td><td className="number">{item.actualBalance === null ? "—" : formatMoney(item.actualBalance, item.currency)}</td><td className={`number ${item.difference === null ? "" : Math.abs(item.difference) <= (item.currency === "USD" ? 0.01 : 1) ? "gain" : "loss"}`}>{item.difference === null ? "—" : formatMoney(item.difference, item.currency)}</td><td><span className={`reconciliation-status status-${item.status}`}>{item.status === "matched" ? "已一致" : item.status === "difference" ? "有差额" : "未核对"}</span></td><td><button className="button secondary compact" onClick={() => onReconcile(item)}>录入余额</button></td></tr>)}</tbody></table></div>}
+        <div className="panel-header"><div><h2>对账与数据质量</h2><span>同一家银行的人民币与美元资产合并；银行 App 三个分项均按人民币录入</span></div><div className="segmented"><button className={section === "banks" ? "active" : ""} onClick={() => setSection("banks")}>银行对账</button><button className={section === "quality" ? "active" : ""} onClick={() => setSection("quality")}>问题清单 {data.issueCount}</button></div></div>
+        {section === "banks" && <div className="table-scroll"><table className="reconciliation-table"><thead><tr><th>银行</th><th className="number">USD/CNY</th><th className="number">软件理财</th><th className="number">银行理财 / 差额</th><th className="number">软件存款</th><th className="number">银行存款 / 差额</th><th className="number">银行活期</th><th className="number">银行总资产</th><th>状态</th><th /></tr></thead><tbody>{data.institutions.map((item) => <tr key={item.institution}><td><strong>{item.institution}</strong><span>{item.balanceDate ? `核对于 ${item.balanceDate}` : "尚无对账快照"}</span></td><td className="number">{item.hasUsdAssets ? item.usdCnyRate.toFixed(4) : "—"}</td><td className="number"><strong>{formatMoney(item.trackedWealthCny, "CNY")}</strong><span>{item.usdWealthValue > 0 ? `含 ${formatMoney(item.usdWealthValue, "USD")}` : "仅人民币"}</span></td><td className="number">{item.actualWealthCny === null ? "—" : formatMoney(item.actualWealthCny, "CNY")}<span className={item.wealthDifference === null ? "" : Math.abs(item.wealthDifference) <= 1 ? "gain" : "loss"}>{item.wealthDifference === null ? "" : `差 ${formatMoney(item.wealthDifference, "CNY")}`}</span></td><td className="number"><strong>{formatMoney(item.trackedDepositCny, "CNY")}</strong><span>{item.usdDepositValue > 0 ? `含 ${formatMoney(item.usdDepositValue, "USD")}` : "仅人民币"}</span></td><td className="number">{item.actualDepositCny === null ? "—" : formatMoney(item.actualDepositCny, "CNY")}<span className={item.depositDifference === null ? "" : Math.abs(item.depositDifference) <= 1 ? "gain" : "loss"}>{item.depositDifference === null ? "" : `差 ${formatMoney(item.depositDifference, "CNY")}`}</span></td><td className="number">{item.balanceDate ? formatMoney(item.demandCny, "CNY") : "—"}</td><td className="number"><strong>{item.actualTotalCny === null ? "—" : formatMoney(item.actualTotalCny, "CNY")}</strong><span>{item.difference === null ? "" : `总差 ${formatMoney(item.difference, "CNY")}`}</span></td><td><span className={`reconciliation-status status-${item.status}`}>{item.status === "matched" ? "已一致" : item.status === "difference" ? "有差额" : "未核对"}</span></td><td><button className="button secondary compact" onClick={() => onReconcile(item)}>录入分项</button></td></tr>)}</tbody></table></div>}
         {section === "quality" && <><div className="quality-toolbar"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索问题" /></label><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">全部优先级</option><option value="high">高优先级</option><option value="medium">中优先级</option><option value="low">低优先级</option></select><span>显示 {filteredIssues.length}/{data.issues.length} 项</span></div><div className="quality-list">{filteredIssues.map((issue) => <article key={issue.key} className={`quality-item severity-${issue.severity}`}><div className="quality-severity">{issue.severity === "high" ? "高" : issue.severity === "medium" ? "中" : "低"}</div><div><span>{issue.category}</span><strong>{issue.title}</strong><p>{issue.detail}</p></div><button className="button secondary compact" onClick={() => onOpenIssue(issue)}>前往处理</button></article>)}{!filteredIssues.length && <div className="quality-empty"><CheckCircle2 />当前筛选下没有待处理问题</div>}</div></>}
       </article>
     </>
   );
 }
 
-function BalanceReconciliationModal({ account, onClose, onSave }: { account: AccountReconciliation; onClose: () => void; onSave: (input: BalanceSnapshotInput) => Promise<void> }) {
-  const [balanceDate, setBalanceDate] = useState(account.balanceDate ?? new Date().toISOString().slice(0, 10));
-  const [actualBalance, setActualBalance] = useState(account.actualBalance?.toString() ?? "");
-  const [note, setNote] = useState(account.note ?? "");
+function InstitutionReconciliationModal({ institution, onClose, onSave }: { institution: InstitutionReconciliation; onClose: () => void; onSave: (input: InstitutionSnapshotInput) => Promise<void> }) {
+  const [balanceDate, setBalanceDate] = useState(institution.balanceDate ?? new Date().toISOString().slice(0, 10));
+  const [usdCnyRate, setUsdCnyRate] = useState(institution.usdCnyRate.toString());
+  const [actualWealthCny, setActualWealthCny] = useState(institution.actualWealthCny?.toString() ?? "");
+  const [actualDepositCny, setActualDepositCny] = useState(institution.actualDepositCny?.toString() ?? "");
+  const [demandCny, setDemandCny] = useState(institution.balanceDate ? institution.demandCny.toString() : "");
+  const [note, setNote] = useState(institution.note ?? "");
   const [submitting, setSubmitting] = useState(false);
-  const actual = actualBalance.trim() === "" ? null : Number(actualBalance);
-  const difference = actual !== null && Number.isFinite(actual) ? actual - account.trackedTotal : null;
+  const rate = Number(usdCnyRate);
+  const wealth = Number(actualWealthCny);
+  const deposit = Number(actualDepositCny);
+  const demand = Number(demandCny);
+  const validInputs = [rate, wealth, deposit, demand].every((value) => Number.isFinite(value) && value >= 0) && rate > 0 && actualWealthCny !== "" && actualDepositCny !== "" && demandCny !== "";
+  const conversionRate = Number.isFinite(rate) && rate > 0 ? rate : institution.usdCnyRate;
+  const trackedWealth = institution.cnyWealthValue + institution.usdWealthValue * conversionRate;
+  const trackedDeposit = institution.cnyDepositValue + institution.usdDepositValue * conversionRate;
+  const wealthDifference = validInputs ? wealth - trackedWealth : null;
+  const depositDifference = validInputs ? deposit - trackedDeposit : null;
+  const actualTotal = validInputs ? wealth + deposit + demand : null;
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (actual === null || !Number.isFinite(actual) || actual < 0) return;
+    if (!validInputs) return;
     setSubmitting(true);
     try {
-      await onSave({ accountId: account.accountId, balanceDate, actualBalance: actual, note: note.trim() || null });
+      await onSave({ institution: institution.institution, balanceDate, usdCnyRate: rate, actualWealthCny: wealth, actualDepositCny: deposit, demandCny: demand, note: note.trim() || null });
     } finally {
       setSubmitting(false);
     }
@@ -1008,9 +1027,19 @@ function BalanceReconciliationModal({ account, onClose, onSave }: { account: Acc
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="modal reconciliation-modal" role="dialog" aria-modal="true" aria-labelledby="reconciliation-title" onMouseDown={(event) => event.stopPropagation()}>
-        <div className="modal-header"><div><h2 id="reconciliation-title">核对 {account.institution}</h2><p>{account.name} · {account.currency}</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
-        <div className="reconciliation-breakdown"><div><span>理财市值</span><strong>{formatMoney(account.wealthValue, account.currency)}</strong></div><div><span>有效定存本金</span><strong>{formatMoney(account.depositValue, account.currency)}</strong></div><div><span>账本资产合计</span><strong>{formatMoney(account.trackedTotal, account.currency)}</strong></div></div>
-        <form className="entry-form reconciliation-form" onSubmit={(event) => void submit(event)}><label>对账日期<DateInput required ariaLabel="对账日期" value={balanceDate} onChange={setBalanceDate} /></label><label>银行显示总资产<input required autoFocus type="number" min="0" step="0.01" value={actualBalance} onChange={(event) => setActualBalance(event.target.value)} placeholder="输入银行页面的账户总资产" /></label><label className="full-field">备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：包含活期余额、待入账收益" /></label><div className={`reconciliation-difference full-field ${difference === null ? "" : Math.abs(difference) <= (account.currency === "USD" ? 0.01 : 1) ? "matched" : "unmatched"}`}><span>预计差额</span><strong>{difference === null ? "—" : formatMoney(difference, account.currency)}</strong><small>{difference === null ? "录入银行总资产后自动计算" : Math.abs(difference) <= (account.currency === "USD" ? 0.01 : 1) ? "与账本一致" : "差额可能来自未录入现金、漏记产品或入账时间差"}</small></div><div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Scale />{submitting ? "保存中…" : "保存对账"}</button></div></form>
+        <div className="modal-header"><div><h2 id="reconciliation-title">核对 {institution.institution}</h2><p>银行 App 的理财、存款、活期均按人民币录入</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
+        <div className="native-assets"><span>软件原币资产</span><p>理财：{formatMoney(institution.cnyWealthValue, "CNY")}{institution.usdWealthValue > 0 ? ` + ${formatMoney(institution.usdWealthValue, "USD")}` : ""}</p><p>存款：{formatMoney(institution.cnyDepositValue, "CNY")}{institution.usdDepositValue > 0 ? ` + ${formatMoney(institution.usdDepositValue, "USD")}` : ""}</p></div>
+        <form className="entry-form reconciliation-form" onSubmit={(event) => void submit(event)}>
+          <label>对账日期<DateInput required ariaLabel="对账日期" value={balanceDate} onChange={setBalanceDate} /></label>
+          <label>美元兑人民币汇率<input required type="number" min="0.0001" step="0.0001" value={usdCnyRate} onChange={(event) => setUsdCnyRate(event.target.value)} disabled={!institution.hasUsdAssets} /><small>{institution.hasUsdAssets ? "用于折算该银行的美元理财和美元存款" : "该银行目前没有美元资产，无需折算"}</small></label>
+          <label>银行 App · 理财（人民币）<input required autoFocus type="number" min="0" step="0.01" value={actualWealthCny} onChange={(event) => setActualWealthCny(event.target.value)} placeholder="银行显示的理财分项" /></label>
+          <label>银行 App · 存款（人民币）<input required type="number" min="0" step="0.01" value={actualDepositCny} onChange={(event) => setActualDepositCny(event.target.value)} placeholder="银行显示的存款分项" /></label>
+          <label className="full-field">银行 App · 活期（人民币）<input required type="number" min="0" step="0.01" value={demandCny} onChange={(event) => setDemandCny(event.target.value)} placeholder="含已折算的人民币与外币活期" /><small>活期会作为独立资产计入资产总览，不会被当作对账差额</small></label>
+          <div className="reconciliation-breakdown full-field"><div><span>软件理财（折算）</span><strong>{formatMoney(trackedWealth, "CNY")}</strong><small className={wealthDifference === null ? "" : Math.abs(wealthDifference) <= 1 ? "gain" : "loss"}>{wealthDifference === null ? "等待录入" : `差 ${formatMoney(wealthDifference, "CNY")}`}</small></div><div><span>软件存款（折算）</span><strong>{formatMoney(trackedDeposit, "CNY")}</strong><small className={depositDifference === null ? "" : Math.abs(depositDifference) <= 1 ? "gain" : "loss"}>{depositDifference === null ? "等待录入" : `差 ${formatMoney(depositDifference, "CNY")}`}</small></div><div><span>银行总资产</span><strong>{actualTotal === null ? "—" : formatMoney(actualTotal, "CNY")}</strong><small>理财 + 存款 + 活期</small></div></div>
+          <label className="full-field">备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：银行 App 数据截至时间、汇率来源" /></label>
+          <div className={`reconciliation-difference full-field ${wealthDifference === null || depositDifference === null ? "" : Math.abs(wealthDifference) <= 1 && Math.abs(depositDifference) <= 1 ? "matched" : "unmatched"}`}><span>分项核对结果</span><strong>{wealthDifference === null || depositDifference === null ? "—" : Math.abs(wealthDifference) <= 1 && Math.abs(depositDifference) <= 1 ? "一致" : "有差额"}</strong><small>理财和存款分别核对，避免两个分项的差额相互抵消</small></div>
+          <div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting || !validInputs}><Scale />{submitting ? "保存中…" : "保存分项对账"}</button></div>
+        </form>
       </section>
     </div>
   );
