@@ -160,6 +160,53 @@ struct AccountRecord {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct AccountReconciliation {
+    account_id: i64,
+    institution: String,
+    name: String,
+    currency: String,
+    wealth_value: f64,
+    deposit_value: f64,
+    tracked_total: f64,
+    actual_balance: Option<f64>,
+    difference: Option<f64>,
+    balance_date: Option<String>,
+    note: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BalanceSnapshotInput {
+    account_id: i64,
+    balance_date: String,
+    actual_balance: f64,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QualityIssue {
+    key: String,
+    severity: String,
+    category: String,
+    title: String,
+    detail: String,
+    target_view: String,
+    target_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconciliationCenter {
+    accounts: Vec<AccountReconciliation>,
+    issues: Vec<QualityIssue>,
+    issue_count: usize,
+    high_priority_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ProductRecord {
     id: i64,
     code: String,
@@ -255,6 +302,7 @@ struct TransactionRecord {
     id: i64,
     title: String,
     code: Option<String>,
+    institution: Option<String>,
     operation: String,
     trade_date: String,
     amount: f64,
@@ -482,6 +530,17 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
           changed_at TEXT NOT NULL,
           before_json TEXT NOT NULL,
           after_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS account_balance_snapshots (
+          id INTEGER PRIMARY KEY,
+          account_id INTEGER NOT NULL,
+          balance_date TEXT NOT NULL,
+          actual_balance REAL NOT NULL,
+          note TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(account_id) REFERENCES accounts(id),
+          UNIQUE(account_id, balance_date)
         );
         "#,
     )?;
@@ -1763,7 +1822,8 @@ fn clear_excel_data(tx: &Transaction<'_>) -> rusqlite::Result<()> {
          AND id NOT IN (SELECT DISTINCT account_id FROM transactions WHERE account_id IS NOT NULL)
          AND id NOT IN (SELECT DISTINCT account_id FROM position_lots)
          AND id NOT IN (SELECT DISTINCT account_id FROM valuations)
-         AND id NOT IN (SELECT DISTINCT account_id FROM deposits)",
+         AND id NOT IN (SELECT DISTINCT account_id FROM deposits)
+         AND id NOT IN (SELECT DISTINCT account_id FROM account_balance_snapshots)",
         [],
     )?;
     Ok(())
@@ -3028,6 +3088,329 @@ fn list_master_data_from_conn(conn: &Connection) -> Result<MasterData, String> {
     })
 }
 
+fn reconciliation_center_from_conn(conn: &Connection) -> Result<ReconciliationCenter, String> {
+    let accounts = {
+        let mut statement = conn
+            .prepare(
+                "SELECT a.id, a.institution, a.name, a.currency,
+                        COALESCE((
+                          SELECT SUM(v.market_value) FROM valuations v
+                          WHERE v.account_id = a.id AND v.is_current = 1
+                        ), 0),
+                        COALESCE((
+                          SELECT SUM(d.principal) FROM deposits d
+                          WHERE d.account_id = a.id AND d.status = 'active'
+                        ), 0),
+                        s.actual_balance, s.balance_date, s.note
+                 FROM accounts a
+                 LEFT JOIN account_balance_snapshots s ON s.id = (
+                   SELECT s2.id FROM account_balance_snapshots s2
+                   WHERE s2.account_id = a.id
+                   ORDER BY s2.balance_date DESC, s2.id DESC LIMIT 1
+                 )
+                 ORDER BY a.currency, a.institution, a.name",
+            )
+            .map_err(|error| error.to_string())?;
+        let records = statement
+            .query_map([], |row| {
+                let wealth_value: f64 = row.get(4)?;
+                let deposit_value: f64 = row.get(5)?;
+                let tracked_total = wealth_value + deposit_value;
+                let actual_balance: Option<f64> = row.get(6)?;
+                let difference = actual_balance.map(|value| value - tracked_total);
+                let currency: String = row.get(3)?;
+                let tolerance = if currency == "USD" { 0.01 } else { 1.0 };
+                let status = match difference {
+                    None => "missing",
+                    Some(value) if value.abs() <= tolerance => "matched",
+                    Some(_) => "difference",
+                };
+                Ok(AccountReconciliation {
+                    account_id: row.get(0)?,
+                    institution: row.get(1)?,
+                    name: row.get(2)?,
+                    currency,
+                    wealth_value,
+                    deposit_value,
+                    tracked_total,
+                    actual_balance,
+                    difference,
+                    balance_date: row.get(7)?,
+                    note: row.get(8)?,
+                    status: status.to_string(),
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        records
+    };
+
+    let mut issues = Vec::new();
+    for account in &accounts {
+        if account.tracked_total <= 0.000_001 && account.actual_balance.is_none() {
+            continue;
+        }
+        match account.status.as_str() {
+            "missing" => issues.push(QualityIssue {
+                key: format!("reconciliation-missing-{}", account.account_id),
+                severity: "medium".to_string(),
+                category: "账户对账".to_string(),
+                title: format!("{} 尚未核对", account.institution),
+                detail: format!(
+                    "账本记录 {} 资产 {:.2} {}，请录入银行页面显示的账户总资产",
+                    account.name, account.tracked_total, account.currency
+                ),
+                target_view: "reconciliation".to_string(),
+                target_id: Some(account.account_id),
+            }),
+            "difference" => issues.push(QualityIssue {
+                key: format!("reconciliation-difference-{}", account.account_id),
+                severity: "high".to_string(),
+                category: "账户对账".to_string(),
+                title: format!("{} 存在对账差额", account.institution),
+                detail: format!(
+                    "银行余额与账本相差 {:+.2} {}，请检查现金、漏记产品或入账时差",
+                    account.difference.unwrap_or_default(),
+                    account.currency
+                ),
+                target_view: "reconciliation".to_string(),
+                target_id: Some(account.account_id),
+            }),
+            _ => {}
+        }
+    }
+
+    {
+        let mut statement = conn
+            .prepare(
+                "SELECT t.id, COALESCE(p.name, '历史理财'), t.trade_date, t.amount, t.currency
+                 FROM transactions t LEFT JOIN products p ON p.id = t.product_id
+                 WHERE t.transaction_type = 'REDEEM' AND t.source = 'excel'
+                   AND t.note LIKE '%待核对%' AND t.reversed_by IS NULL
+                 ORDER BY t.trade_date DESC, t.id DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for (id, name, date, amount, currency) in rows {
+            issues.push(QualityIssue {
+                key: format!("redeem-review-{id}"),
+                severity: "high".to_string(),
+                category: "历史流水".to_string(),
+                title: format!("{name} 的历史赎回金额待核对"),
+                detail: format!(
+                    "{date} 暂按 {:.2} {currency} 生成，会影响历史收益和 XIRR",
+                    amount
+                ),
+                target_view: "transactions".to_string(),
+                target_id: Some(id),
+            });
+        }
+    }
+
+    {
+        let mut statement = conn
+            .prepare(
+                "SELECT d.id, d.name, a.institution, d.maturity_date
+                 FROM deposits d JOIN accounts a ON a.id = d.account_id
+                 WHERE d.status = 'active' AND (d.start_date IS NULL OR trim(d.start_date) = '')
+                 ORDER BY d.maturity_date",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for (id, name, institution, maturity) in rows {
+            issues.push(QualityIssue {
+                key: format!("deposit-start-date-{id}"),
+                severity: "medium".to_string(),
+                category: "定期存款".to_string(),
+                title: format!("{name} 缺少起息日"),
+                detail: format!(
+                    "{institution} · 到期日 {maturity}；补全后才能纳入准确的期限收益分析"
+                ),
+                target_view: "masterData".to_string(),
+                target_id: Some(id),
+            });
+        }
+    }
+
+    {
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT p.id, p.name, p.code FROM products p
+                 WHERE (p.risk_level IS NULL OR trim(p.risk_level) = '')
+                   AND EXISTS (
+                     SELECT 1 FROM valuations v
+                     WHERE v.product_id = p.id AND v.is_current = 1
+                       AND v.market_value > 0.000001
+                   )
+                 ORDER BY p.name",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for (id, name, code) in rows {
+            issues.push(QualityIssue {
+                key: format!("product-risk-{id}"),
+                severity: "low".to_string(),
+                category: "产品资料".to_string(),
+                title: format!("{name} 缺少风险等级"),
+                detail: format!("产品代码 {code}；补全 R1–R5 后，操作参考才能纳入风险约束"),
+                target_view: "masterData".to_string(),
+                target_id: Some(id),
+            });
+        }
+    }
+
+    {
+        let today = Local::now().date_naive();
+        let mut statement = conn
+            .prepare(
+                "SELECT v.product_id, p.name, v.valuation_date
+                 FROM valuations v JOIN products p ON p.id = v.product_id
+                 WHERE v.is_current = 1 AND v.market_value > 0.000001",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for (id, name, date) in rows {
+            let valued_on = NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap_or(today);
+            let days = (today - valued_on).num_days().max(0);
+            if days > 10 {
+                issues.push(QualityIssue {
+                    key: format!("stale-valuation-{id}"),
+                    severity: "medium".to_string(),
+                    category: "市值更新".to_string(),
+                    title: format!("{name} 的市值已过期"),
+                    detail: format!("最近更新于 {date}，距今 {days} 天"),
+                    target_view: "holdings".to_string(),
+                    target_id: Some(id),
+                });
+            }
+        }
+    }
+
+    let last_warnings: Option<String> = conn
+        .query_row(
+            "SELECT warnings_json FROM import_runs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(json) = last_warnings {
+        if let Ok(warnings) = serde_json::from_str::<Vec<String>>(&json) {
+            for (index, warning) in warnings.into_iter().enumerate() {
+                issues.push(QualityIssue {
+                    key: format!("import-warning-{index}"),
+                    severity: "medium".to_string(),
+                    category: "Excel 导入".to_string(),
+                    title: "最近一次导入存在校验提醒".to_string(),
+                    detail: warning,
+                    target_view: "reconciliation".to_string(),
+                    target_id: None,
+                });
+            }
+        }
+    }
+    issues.sort_by_key(|issue| match issue.severity.as_str() {
+        "high" => 0,
+        "medium" => 1,
+        _ => 2,
+    });
+    let high_priority_count = issues
+        .iter()
+        .filter(|issue| issue.severity == "high")
+        .count();
+    Ok(ReconciliationCenter {
+        accounts,
+        issue_count: issues.len(),
+        high_priority_count,
+        issues,
+    })
+}
+
+fn apply_balance_snapshot(
+    conn: &mut Connection,
+    input: &BalanceSnapshotInput,
+) -> Result<EntryResult, String> {
+    let balance_date = valid_date(&input.balance_date, "对账日期")?;
+    if !input.actual_balance.is_finite() || input.actual_balance < 0.0 {
+        return Err("银行显示总资产必须是大于或等于0的有效数字".to_string());
+    }
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
+            [input.account_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !exists {
+        return Err("没有找到所选账户".to_string());
+    }
+    conn.execute(
+        "INSERT INTO account_balance_snapshots
+           (account_id, balance_date, actual_balance, note, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(account_id, balance_date) DO UPDATE SET
+           actual_balance = excluded.actual_balance,
+           note = excluded.note,
+           created_at = excluded.created_at",
+        params![
+            input.account_id,
+            balance_date,
+            input.actual_balance,
+            input.note,
+            Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(EntryResult {
+        message: "账户余额已核对，差额和数据质量清单已更新".to_string(),
+        realized_gain: None,
+    })
+}
+
 fn record_master_change(
     tx: &Transaction<'_>,
     entity_type: &str,
@@ -3084,7 +3467,8 @@ fn apply_master_data_update(
                        (SELECT COUNT(*) FROM transactions WHERE account_id = ?1 OR transfer_account_id = ?1) +
                        (SELECT COUNT(*) FROM position_lots WHERE account_id = ?1) +
                        (SELECT COUNT(*) FROM valuations WHERE account_id = ?1) +
-                       (SELECT COUNT(*) FROM deposits WHERE account_id = ?1)",
+                       (SELECT COUNT(*) FROM deposits WHERE account_id = ?1) +
+                       (SELECT COUNT(*) FROM account_balance_snapshots WHERE account_id = ?1)",
                     [input.id],
                     |row| row.get(0),
                 )
@@ -3633,6 +4017,28 @@ fn update_master_data(
 }
 
 #[tauri::command]
+fn get_reconciliation_center(state: State<'_, AppState>) -> Result<ReconciliationCenter, String> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    reconciliation_center_from_conn(&conn)
+}
+
+#[tauri::command]
+fn save_balance_snapshot(
+    input: BalanceSnapshotInput,
+    state: State<'_, AppState>,
+) -> Result<EntryResult, String> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    create_auto_backup(&conn, &state.backup_dir, "pre-reconciliation")?;
+    apply_balance_snapshot(&mut conn, &input)
+}
+
+#[tauri::command]
 fn get_analytics(state: State<'_, AppState>) -> Result<Analytics, String> {
     let conn = state
         .db
@@ -3981,6 +4387,9 @@ fn list_transactions(state: State<'_, AppState>) -> Result<Vec<TransactionRecord
                       COALESCE(a.institution, '未知账户') || ' → ' || COALESCE(ta.institution, '未知账户')
                     ELSE COALESCE(p.name, d.name, a.institution, '未命名交易') END AS title,
                     p.code,
+                    CASE WHEN t.transaction_type = 'TRANSFER' THEN
+                      COALESCE(a.institution, '未知账户') || ' → ' || COALESCE(ta.institution, '未知账户')
+                    ELSE a.institution END,
                     t.transaction_type,
                     t.trade_date,
                     t.amount,
@@ -4006,19 +4415,20 @@ fn list_transactions(state: State<'_, AppState>) -> Result<Vec<TransactionRecord
                 id: row.get(0)?,
                 title: row.get(1)?,
                 code: row.get(2)?,
-                operation: row.get(3)?,
-                trade_date: row.get(4)?,
-                amount: row.get(5)?,
-                cost_basis: row.get(6)?,
-                realized_gain: row.get(7)?,
-                currency: row.get(8)?,
-                note: row.get(9)?,
-                source: row.get(10)?,
-                reversed_by: row.get(11)?,
-                reversal_of: row.get(12)?,
-                can_reverse: row.get::<_, String>(10)? == "manual"
-                    && row.get::<_, Option<i64>>(11)?.is_none()
-                    && row.get::<_, String>(3)? != "REVERSAL",
+                institution: row.get(3)?,
+                operation: row.get(4)?,
+                trade_date: row.get(5)?,
+                amount: row.get(6)?,
+                cost_basis: row.get(7)?,
+                realized_gain: row.get(8)?,
+                currency: row.get(9)?,
+                note: row.get(10)?,
+                source: row.get(11)?,
+                reversed_by: row.get(12)?,
+                reversal_of: row.get(13)?,
+                can_reverse: row.get::<_, String>(11)? == "manual"
+                    && row.get::<_, Option<i64>>(12)?.is_none()
+                    && row.get::<_, String>(4)? != "REVERSAL",
             })
         })
         .map_err(|error| error.to_string())?;
@@ -4151,6 +4561,8 @@ pub fn run() {
             export_excel_file,
             list_master_data,
             update_master_data,
+            get_reconciliation_center,
+            save_balance_snapshot,
             get_analytics
         ])
         .run(tauri::generate_context!())
@@ -4244,7 +4656,7 @@ mod tests {
                 row.get(0)
             })
             .expect("valuation date");
-        assert_eq!(valuation_date, "2026-08-07");
+        assert_eq!(valuation_date, Local::now().format("%Y-%m-%d").to_string());
     }
 
     fn entry(operation: &str, amount: f64) -> EntryInput {
@@ -4345,22 +4757,24 @@ mod tests {
         migrate(&conn).expect("migrate");
         parse_workbook(&workbook, &mut conn).expect("first import");
 
-        let (product, account, market): (i64, i64, f64) = conn
+        let (product, account, institution, currency): (i64, i64, String, String) = conn
             .query_row(
-                "SELECT v.product_id, v.account_id, v.market_value
-                 FROM valuations v
+                "SELECT v.product_id, v.account_id, a.institution, a.currency
+                 FROM valuations v JOIN accounts a ON a.id = v.account_id
                  WHERE v.is_current = 1 AND v.market_value > 1000
-                   AND EXISTS (
-                     SELECT 1 FROM position_lots l
-                     WHERE l.product_id = v.product_id AND l.account_id = v.account_id
-                       AND l.status = 'active'
-                   )
                  LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("imported holding");
-        let mut sale = entry("SELL", market / 10.0);
+        let mut buy = entry("BUY", 10_000.0);
+        buy.product_id = Some(product);
+        buy.account_id = Some(account);
+        buy.institution = Some(institution);
+        buy.currency = Some(currency);
+        apply_entry(&mut conn, &buy).expect("manual buy");
+
+        let mut sale = entry("SELL", 1_000.0);
         sale.product_id = Some(product);
         sale.account_id = Some(account);
         apply_entry(&mut conn, &sale).expect("manual sale");
@@ -4766,5 +5180,86 @@ mod tests {
         .expect("return calculation")
         .expect("return exists");
         assert!((return_rate - 0.02).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn account_reconciliation_records_snapshots_and_detects_differences() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        apply_entry(&mut conn, &entry("BUY", 10_000.0)).expect("buy");
+        let initial = reconciliation_center_from_conn(&conn).expect("initial center");
+        let account = initial
+            .accounts
+            .iter()
+            .find(|item| item.tracked_total > 0.0)
+            .expect("tracked account");
+        assert_eq!(account.status, "missing");
+        let account_id = account.account_id;
+        let tracked_total = account.tracked_total;
+        let input = BalanceSnapshotInput {
+            account_id,
+            balance_date: "2026-08-09".to_string(),
+            actual_balance: tracked_total,
+            note: Some("首次核对".to_string()),
+        };
+        apply_balance_snapshot(&mut conn, &input).expect("matched snapshot");
+        let matched = reconciliation_center_from_conn(&conn).expect("matched center");
+        assert_eq!(
+            matched
+                .accounts
+                .iter()
+                .find(|item| item.account_id == account_id)
+                .expect("matched account")
+                .status,
+            "matched"
+        );
+        let changed = BalanceSnapshotInput {
+            actual_balance: tracked_total + 88.0,
+            ..input
+        };
+        apply_balance_snapshot(&mut conn, &changed).expect("updated snapshot");
+        let different = reconciliation_center_from_conn(&conn).expect("different center");
+        let account = different
+            .accounts
+            .iter()
+            .find(|item| item.account_id == account_id)
+            .expect("different account");
+        assert_eq!(account.status, "difference");
+        assert!((account.difference.unwrap_or_default() - 88.0).abs() < 0.01);
+        let snapshots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_balance_snapshots",
+                [],
+                |row| row.get(0),
+            )
+            .expect("snapshot count");
+        assert_eq!(snapshots, 1);
+    }
+
+    #[test]
+    fn data_quality_center_surfaces_imported_records_that_need_completion() {
+        let workbook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../理财.xlsx");
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        parse_workbook(&workbook, &mut conn).expect("import workbook");
+        let center = reconciliation_center_from_conn(&conn).expect("quality center");
+        assert!(center.issue_count > 20);
+        assert!(center.high_priority_count > 0);
+        assert!(center
+            .issues
+            .iter()
+            .any(|issue| issue.category == "历史流水"));
+        assert!(center
+            .issues
+            .iter()
+            .any(|issue| issue.category == "定期存款"));
+        assert!(center
+            .issues
+            .iter()
+            .any(|issue| issue.category == "产品资料"));
+        assert!(center
+            .issues
+            .iter()
+            .any(|issue| issue.category == "账户对账"));
     }
 }

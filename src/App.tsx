@@ -14,11 +14,14 @@ import {
   FileSpreadsheet,
   HardDriveDownload,
   LayoutDashboard,
+  ListFilter,
   Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
   Save,
+  Scale,
+  Search,
   ShieldCheck,
   Settings2,
   Sparkles,
@@ -27,7 +30,7 @@ import {
 } from "lucide-react";
 import "./App.css";
 
-type View = "overview" | "holdings" | "transactions" | "calendar" | "analytics" | "masterData";
+type View = "overview" | "holdings" | "transactions" | "calendar" | "analytics" | "masterData" | "reconciliation";
 type CurrencyCode = "CNY" | "USD";
 type EntryOperation = "BUY" | "SELL" | "PRODUCT_MATURITY" | "VALUATION" | "DIVIDEND" | "FEE" | "TRANSFER" | "DEPOSIT_OPEN" | "DEPOSIT_MATURITY";
 
@@ -79,6 +82,7 @@ type TransactionRecord = {
   id: number;
   title: string;
   code: string | null;
+  institution: string | null;
   operation: string;
   tradeDate: string;
   amount: number;
@@ -118,6 +122,11 @@ type EntryInput = {
 
 type EntryResult = { message: string; realizedGain: number | null };
 type FileOperationResult = { path: string; message: string };
+
+type AccountReconciliation = { accountId: number; institution: string; name: string; currency: CurrencyCode; wealthValue: number; depositValue: number; trackedTotal: number; actualBalance: number | null; difference: number | null; balanceDate: string | null; note: string | null; status: "missing" | "matched" | "difference" };
+type QualityIssue = { key: string; severity: "high" | "medium" | "low"; category: string; title: string; detail: string; targetView: View; targetId: number | null };
+type ReconciliationCenter = { accounts: AccountReconciliation[]; issues: QualityIssue[]; issueCount: number; highPriorityCount: number };
+type BalanceSnapshotInput = { accountId: number; balanceDate: string; actualBalance: number; note: string | null };
 
 type AccountRecord = { id: number; institution: string; name: string; currency: CurrencyCode; source: string };
 type ProductRecord = { id: number; code: string; name: string; currency: CurrencyCode; issuer: string | null; riskLevel: string | null; source: string };
@@ -177,6 +186,7 @@ const EMPTY_DASHBOARD: Dashboard = {
 
 const EMPTY_MASTER_DATA: MasterData = { accounts: [], products: [], deposits: [] };
 const EMPTY_ANALYTICS: Analytics = { asOfDate: new Date().toISOString().slice(0, 10), currencies: [] };
+const EMPTY_RECONCILIATION: ReconciliationCenter = { accounts: [], issues: [], issueCount: 0, highPriorityCount: 0 };
 
 const viewTitles: Record<View, string> = {
   overview: "资产总览",
@@ -185,6 +195,7 @@ const viewTitles: Record<View, string> = {
   calendar: "到期日历",
   analytics: "收益分析",
   masterData: "资料管理",
+  reconciliation: "对账与数据质量",
 };
 
 function formatMoney(value: number, currency: CurrencyCode) {
@@ -208,6 +219,7 @@ function App() {
   const [transactions, setTransactions] = useState<TransactionRecord[]>([]);
   const [masterData, setMasterData] = useState<MasterData>(EMPTY_MASTER_DATA);
   const [analytics, setAnalytics] = useState<Analytics>(EMPTY_ANALYTICS);
+  const [reconciliation, setReconciliation] = useState<ReconciliationCenter>(EMPTY_RECONCILIATION);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -220,18 +232,20 @@ function App() {
   const [editingRecord, setEditingRecord] = useState<EditableRecord | null>(null);
   const [holdingDetail, setHoldingDetail] = useState<HoldingDetail | null>(null);
   const [holdingDetailLoading, setHoldingDetailLoading] = useState(false);
+  const [reconcilingAccount, setReconcilingAccount] = useState<AccountReconciliation | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [nextDashboard, nextHoldings, nextMaturities, nextTransactions, nextMasterData, nextAnalytics] = await Promise.all([
+      const [nextDashboard, nextHoldings, nextMaturities, nextTransactions, nextMasterData, nextAnalytics, nextReconciliation] = await Promise.all([
         invoke<Dashboard>("get_dashboard"),
         invoke<Holding[]>("list_holdings"),
         invoke<MaturityEvent[]>("list_maturities"),
         invoke<TransactionRecord[]>("list_transactions"),
         invoke<MasterData>("list_master_data"),
         invoke<Analytics>("get_analytics"),
+        invoke<ReconciliationCenter>("get_reconciliation_center"),
       ]);
       setDashboard(nextDashboard);
       setHoldings(nextHoldings);
@@ -239,6 +253,7 @@ function App() {
       setTransactions(nextTransactions);
       setMasterData(nextMasterData);
       setAnalytics(nextAnalytics);
+      setReconciliation(nextReconciliation);
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -433,6 +448,26 @@ function App() {
     }
   };
 
+  const saveBalanceSnapshot = async (input: BalanceSnapshotInput) => {
+    setError(null);
+    setLoading(true);
+    try {
+      const result = await invoke<EntryResult>("save_balance_snapshot", { input });
+      setNotice(result.message);
+      setReconcilingAccount(null);
+      await refresh();
+    } catch (reason) {
+      setError(String(reason));
+      setLoading(false);
+      throw reason;
+    }
+  };
+
+  const openQualityIssue = (issue: QualityIssue) => {
+    setView(issue.targetView);
+    if (issue.targetView === "transactions" && issue.targetId !== null) void openTransaction(issue.targetId);
+  };
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -447,6 +482,7 @@ function App() {
           <NavButton active={view === "calendar"} onClick={() => setView("calendar")} icon={<CalendarDays />} label="到期日历" />
           <NavButton active={view === "analytics"} onClick={() => setView("analytics")} icon={<BarChart3 />} label="收益分析" />
           <NavButton active={view === "masterData"} onClick={() => setView("masterData")} icon={<Settings2 />} label="资料管理" />
+          <NavButton active={view === "reconciliation"} onClick={() => setView("reconciliation")} icon={<Scale />} label={`对账中心${reconciliation.highPriorityCount ? ` · ${reconciliation.highPriorityCount}` : ""}`} />
         </nav>
         <div className="privacy-note"><ShieldCheck /><span>数据仅保存在本机<br />SQLite 自动持久化</span></div>
       </aside>
@@ -488,6 +524,7 @@ function App() {
             {view === "calendar" && <CalendarView groups={groupedMaturities} />}
             {view === "analytics" && <AnalyticsView analytics={analytics} currency={currency} onCurrencyChange={setCurrency} />}
             {view === "masterData" && <MasterDataView data={masterData} onEdit={setEditingRecord} />}
+            {view === "reconciliation" && <ReconciliationView data={reconciliation} onReconcile={setReconcilingAccount} onOpenIssue={openQualityIssue} />}
           </>
         )}
       </main>
@@ -547,6 +584,9 @@ function App() {
       )}
       {holdingDetail && (
         <HoldingDetailModal detail={holdingDetail} onClose={() => setHoldingDetail(null)} />
+      )}
+      {reconcilingAccount && (
+        <BalanceReconciliationModal account={reconcilingAccount} onClose={() => setReconcilingAccount(null)} onSave={saveBalanceSnapshot} />
       )}
     </div>
   );
@@ -615,11 +655,27 @@ function Metric({ label, value, detail, positive }: { label: string; value: stri
 }
 
 function HoldingsView({ holdings, onBatchUpdate, onSelect, loading }: { holdings: Holding[]; onBatchUpdate: () => void; onSelect: (holding: Holding) => void; loading: boolean }) {
+  const [searchText, setSearchText] = useState("");
+  const [currencyFilter, setCurrencyFilter] = useState("all");
+  const [channelFilter, setChannelFilter] = useState("all");
+  const [signalFilter, setSignalFilter] = useState("all");
+  const channels = useMemo(() => [...new Set(holdings.map((item) => item.channel))].sort(), [holdings]);
+  const filtered = useMemo(() => {
+    const keyword = searchText.trim().toLowerCase();
+    return holdings.filter((item) => {
+      const matchesKeyword = !keyword || `${item.name} ${item.code} ${item.channel}`.toLowerCase().includes(keyword);
+      const matchesCurrency = currencyFilter === "all" || item.currency === currencyFilter;
+      const matchesChannel = channelFilter === "all" || item.channel === channelFilter;
+      const matchesSignal = signalFilter === "all" || (signalFilter === "stale" ? item.daysSinceValuation > 10 : item.signal === signalFilter);
+      return matchesKeyword && matchesCurrency && matchesChannel && matchesSignal;
+    });
+  }, [holdings, searchText, currencyFilter, channelFilter, signalFilter]);
   return (
     <article className="panel table-panel">
-      <div className="panel-header holdings-header"><div><h2>当前持仓</h2><span>{holdings.length}个产品 · 点击持仓查看市值与收益历史</span></div><button className="button primary valuation-cta" type="button" onClick={onBatchUpdate}><Activity />批量更新市值</button></div>
+      <div className="panel-header holdings-header"><div><h2>当前持仓</h2><span>显示 {filtered.length}/{holdings.length} 个产品 · 点击持仓查看市值与收益历史</span></div><button className="button primary valuation-cta" type="button" onClick={onBatchUpdate}><Activity />批量更新市值</button></div>
+      <div className="filter-bar holdings-filter"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索产品、代码或渠道" /></label><select value={currencyFilter} onChange={(event) => setCurrencyFilter(event.target.value)}><option value="all">全部币种</option><option value="CNY">人民币</option><option value="USD">美元</option></select><select value={channelFilter} onChange={(event) => setChannelFilter(event.target.value)}><option value="all">全部渠道</option>{channels.map((channel) => <option key={channel} value={channel}>{channel}</option>)}</select><select value={signalFilter} onChange={(event) => setSignalFilter(event.target.value)}><option value="all">全部参考</option><option value="stale">市值待更新</option><option value="REVIEW">评估赎回</option><option value="TAKE_PROFIT">考虑止盈</option><option value="ADD_WATCH">关注加仓</option><option value="HOLD">继续观察</option><option value="OBSERVE">积累数据</option></select></div>
       <div className="table-scroll"><table><thead><tr><th>产品</th><th>渠道</th><th className="number">成本</th><th className="number">市值</th><th className="number">持有收益</th><th className="number">近30日</th><th>最近更新</th><th>操作参考</th></tr></thead><tbody>
-        {holdings.map((item) => <tr className="holding-row" aria-busy={loading} key={`${item.id}-${item.currency}`} onClick={() => onSelect(item)}><td><strong>{item.name}</strong><span>{item.code} · {item.currency}</span></td><td>{item.channel}</td><td className="number">{formatMoney(item.cost, item.currency)}</td><td className="number"><strong>{formatMoney(item.marketValue, item.currency)}</strong></td><td className={`number ${item.gain >= 0 ? "gain" : "loss"}`}>{formatMoney(item.gain, item.currency)}<span>{formatPercent(item.gainRate)}</span></td><td className={`number ${item.thirtyDayReturn === null ? "" : item.thirtyDayReturn >= 0 ? "gain" : "loss"}`}>{item.thirtyDayReturn === null ? "—" : formatPercent(item.thirtyDayReturn)}</td><td><span className={item.daysSinceValuation > 10 ? "stale-date" : "fresh-date"}>{item.valuationDate}</span><small>{item.daysSinceValuation === 0 ? "今天" : `${item.daysSinceValuation}天前`}</small></td><td><span className={`signal-badge signal-${item.signal.toLowerCase()}`}>{item.signalLabel}</span><small className="signal-summary">{item.signalReason}</small></td></tr>)}
+        {filtered.map((item) => <tr className="holding-row" aria-busy={loading} key={`${item.id}-${item.currency}`} onClick={() => onSelect(item)}><td><strong>{item.name}</strong><span>{item.code} · {item.currency}</span></td><td>{item.channel}</td><td className="number">{formatMoney(item.cost, item.currency)}</td><td className="number"><strong>{formatMoney(item.marketValue, item.currency)}</strong></td><td className={`number ${item.gain >= 0 ? "gain" : "loss"}`}>{formatMoney(item.gain, item.currency)}<span>{formatPercent(item.gainRate)}</span></td><td className={`number ${item.thirtyDayReturn === null ? "" : item.thirtyDayReturn >= 0 ? "gain" : "loss"}`}>{item.thirtyDayReturn === null ? "—" : formatPercent(item.thirtyDayReturn)}</td><td><span className={item.daysSinceValuation > 10 ? "stale-date" : "fresh-date"}>{item.valuationDate}</span><small>{item.daysSinceValuation === 0 ? "今天" : `${item.daysSinceValuation}天前`}</small></td><td><span className={`signal-badge signal-${item.signal.toLowerCase()}`}>{item.signalLabel}</span><small className="signal-summary">{item.signalReason}</small></td></tr>)}
       </tbody></table></div>
       <div className="advice-disclaimer"><Sparkles />操作参考仅根据你记录的估值、收益、产品风险等级和持仓占比生成；历史表现不能预测未来，请同时核对期限、赎回规则、费用和个人风险承受能力。</div>
     </article>
@@ -765,6 +821,57 @@ function MasterDataView({ data, onEdit }: { data: MasterData; onEdit: (target: E
   );
 }
 
+function ReconciliationView({ data, onReconcile, onOpenIssue }: { data: ReconciliationCenter; onReconcile: (account: AccountReconciliation) => void; onOpenIssue: (issue: QualityIssue) => void }) {
+  const [section, setSection] = useState<"accounts" | "quality">("accounts");
+  const [severity, setSeverity] = useState("all");
+  const [searchText, setSearchText] = useState("");
+  const matched = data.accounts.filter((item) => item.status === "matched").length;
+  const differences = data.accounts.filter((item) => item.status === "difference").length;
+  const missing = data.accounts.filter((item) => item.status === "missing" && item.trackedTotal > 0.000001).length;
+  const filteredIssues = data.issues.filter((issue) => {
+    const keyword = searchText.trim().toLowerCase();
+    return (severity === "all" || issue.severity === severity) && (!keyword || `${issue.category} ${issue.title} ${issue.detail}`.toLowerCase().includes(keyword));
+  });
+  return (
+    <>
+      <section className="metrics-grid reconciliation-metrics"><Metric label="已核对账户" value={`${matched}`} detail={`共 ${data.accounts.length} 个账户`} positive={matched > 0} /><Metric label="存在差额" value={`${differences}`} detail="银行总资产与账本不一致" positive={differences === 0} /><Metric label="尚未核对" value={`${missing}`} detail="有账本资产但没有余额快照" positive={missing === 0} /><Metric label="数据质量问题" value={`${data.issueCount}`} detail={`${data.highPriorityCount} 项高优先级`} positive={data.highPriorityCount === 0} /></section>
+      <article className="panel reconciliation-panel">
+        <div className="panel-header"><div><h2>对账与数据质量</h2><span>银行显示总资产 − 软件中的理财市值与有效定存本金 = 对账差额</span></div><div className="segmented"><button className={section === "accounts" ? "active" : ""} onClick={() => setSection("accounts")}>账户对账</button><button className={section === "quality" ? "active" : ""} onClick={() => setSection("quality")}>问题清单 {data.issueCount}</button></div></div>
+        {section === "accounts" && <div className="table-scroll"><table className="reconciliation-table"><thead><tr><th>账户</th><th>币种</th><th className="number">理财市值</th><th className="number">定存本金</th><th className="number">账本资产</th><th className="number">银行总资产</th><th className="number">差额</th><th>状态</th><th /></tr></thead><tbody>{data.accounts.map((item) => <tr key={item.accountId}><td><strong>{item.institution}</strong><span>{item.name}{item.balanceDate ? ` · 核对于 ${item.balanceDate}` : ""}</span></td><td>{item.currency}</td><td className="number">{formatMoney(item.wealthValue, item.currency)}</td><td className="number">{formatMoney(item.depositValue, item.currency)}</td><td className="number"><strong>{formatMoney(item.trackedTotal, item.currency)}</strong></td><td className="number">{item.actualBalance === null ? "—" : formatMoney(item.actualBalance, item.currency)}</td><td className={`number ${item.difference === null ? "" : Math.abs(item.difference) <= (item.currency === "USD" ? 0.01 : 1) ? "gain" : "loss"}`}>{item.difference === null ? "—" : formatMoney(item.difference, item.currency)}</td><td><span className={`reconciliation-status status-${item.status}`}>{item.status === "matched" ? "已一致" : item.status === "difference" ? "有差额" : "未核对"}</span></td><td><button className="button secondary compact" onClick={() => onReconcile(item)}>录入余额</button></td></tr>)}</tbody></table></div>}
+        {section === "quality" && <><div className="quality-toolbar"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索问题" /></label><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">全部优先级</option><option value="high">高优先级</option><option value="medium">中优先级</option><option value="low">低优先级</option></select><span>显示 {filteredIssues.length}/{data.issues.length} 项</span></div><div className="quality-list">{filteredIssues.map((issue) => <article key={issue.key} className={`quality-item severity-${issue.severity}`}><div className="quality-severity">{issue.severity === "high" ? "高" : issue.severity === "medium" ? "中" : "低"}</div><div><span>{issue.category}</span><strong>{issue.title}</strong><p>{issue.detail}</p></div><button className="button secondary compact" onClick={() => onOpenIssue(issue)}>前往处理</button></article>)}{!filteredIssues.length && <div className="quality-empty"><CheckCircle2 />当前筛选下没有待处理问题</div>}</div></>}
+      </article>
+    </>
+  );
+}
+
+function BalanceReconciliationModal({ account, onClose, onSave }: { account: AccountReconciliation; onClose: () => void; onSave: (input: BalanceSnapshotInput) => Promise<void> }) {
+  const [balanceDate, setBalanceDate] = useState(account.balanceDate ?? new Date().toISOString().slice(0, 10));
+  const [actualBalance, setActualBalance] = useState(account.actualBalance?.toString() ?? "");
+  const [note, setNote] = useState(account.note ?? "");
+  const [submitting, setSubmitting] = useState(false);
+  const actual = actualBalance.trim() === "" ? null : Number(actualBalance);
+  const difference = actual !== null && Number.isFinite(actual) ? actual - account.trackedTotal : null;
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (actual === null || !Number.isFinite(actual) || actual < 0) return;
+    setSubmitting(true);
+    try {
+      await onSave({ accountId: account.accountId, balanceDate, actualBalance: actual, note: note.trim() || null });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal reconciliation-modal" role="dialog" aria-modal="true" aria-labelledby="reconciliation-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-header"><div><h2 id="reconciliation-title">核对 {account.institution}</h2><p>{account.name} · {account.currency}</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
+        <div className="reconciliation-breakdown"><div><span>理财市值</span><strong>{formatMoney(account.wealthValue, account.currency)}</strong></div><div><span>有效定存本金</span><strong>{formatMoney(account.depositValue, account.currency)}</strong></div><div><span>账本资产合计</span><strong>{formatMoney(account.trackedTotal, account.currency)}</strong></div></div>
+        <form className="entry-form reconciliation-form" onSubmit={(event) => void submit(event)}><label>对账日期<input required type="date" value={balanceDate} onChange={(event) => setBalanceDate(event.target.value)} /></label><label>银行显示总资产<input required autoFocus type="number" min="0" step="0.01" value={actualBalance} onChange={(event) => setActualBalance(event.target.value)} placeholder="输入银行页面的账户总资产" /></label><label className="full-field">备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：包含活期余额、待入账收益" /></label><div className={`reconciliation-difference full-field ${difference === null ? "" : Math.abs(difference) <= (account.currency === "USD" ? 0.01 : 1) ? "matched" : "unmatched"}`}><span>预计差额</span><strong>{difference === null ? "—" : formatMoney(difference, account.currency)}</strong><small>{difference === null ? "录入银行总资产后自动计算" : Math.abs(difference) <= (account.currency === "USD" ? 0.01 : 1) ? "与账本一致" : "差额可能来自未录入现金、漏记产品或入账时间差"}</small></div><div className="entry-actions full-field"><button className="button secondary" type="button" onClick={onClose}>取消</button><button className="button primary" type="submit" disabled={submitting}><Scale />{submitting ? "保存中…" : "保存对账"}</button></div></form>
+      </section>
+    </div>
+  );
+}
+
 const operationLabels: Record<string, string> = {
   BUY: "买入",
   SELL: "卖出",
@@ -784,18 +891,44 @@ function TransactionsView({ transactions, onSelect, loading }: {
   onSelect: (id: number) => void;
   loading: boolean;
 }) {
+  const [searchText, setSearchText] = useState("");
+  const [operationFilter, setOperationFilter] = useState("all");
+  const [currencyFilter, setCurrencyFilter] = useState("all");
+  const [institutionFilter, setInstitutionFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const institutions = useMemo(() => [...new Set(transactions.map((item) => item.institution).filter((item): item is string => Boolean(item)))].sort(), [transactions]);
+  const filtered = useMemo(() => {
+    const keyword = searchText.trim().toLowerCase();
+    return transactions.filter((item) => {
+      const matchesKeyword = !keyword || `${item.title} ${item.code ?? ""} ${item.institution ?? ""} ${item.note ?? ""}`.toLowerCase().includes(keyword);
+      const matchesOperation = operationFilter === "all" || item.operation === operationFilter;
+      const matchesCurrency = currencyFilter === "all" || item.currency === currencyFilter;
+      const matchesInstitution = institutionFilter === "all" || item.institution === institutionFilter;
+      const matchesDate = (!dateFrom || item.tradeDate >= dateFrom) && (!dateTo || item.tradeDate <= dateTo);
+      const matchesStatus = statusFilter === "all" || (statusFilter === "effective" && item.reversedBy === null && item.operation !== "REVERSAL") || (statusFilter === "reversed" && (item.reversedBy !== null || item.operation === "REVERSAL")) || (statusFilter === "review" && item.note?.includes("待核对"));
+      return matchesKeyword && matchesOperation && matchesCurrency && matchesInstitution && matchesDate && matchesStatus;
+    });
+  }, [transactions, searchText, operationFilter, currencyFilter, institutionFilter, statusFilter, dateFrom, dateTo]);
+  const gains = filtered.reduce<Record<CurrencyCode, number>>((totals, item) => {
+    if (item.reversedBy === null && item.operation !== "REVERSAL") totals[item.currency] += item.realizedGain;
+    return totals;
+  }, { CNY: 0, USD: 0 });
   return (
     <article className="panel table-panel">
-      <div className="panel-header"><h2>交易流水</h2><span>最近{transactions.length}笔 · 买卖成本和已实现收益可追溯</span></div>
+      <div className="panel-header"><div><h2>交易流水</h2><span>显示 {filtered.length}/{transactions.length} 笔 · 筛选结果已实现收益 {formatMoney(gains.CNY, "CNY")} / {formatMoney(gains.USD, "USD")}</span></div><button className="button secondary compact" type="button" onClick={() => { setSearchText(""); setOperationFilter("all"); setCurrencyFilter("all"); setInstitutionFilter("all"); setStatusFilter("all"); setDateFrom(""); setDateTo(""); }}><ListFilter />清除筛选</button></div>
+      <div className="filter-bar transaction-filters"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索产品、代码、银行或备注" /></label><select value={operationFilter} onChange={(event) => setOperationFilter(event.target.value)}><option value="all">全部操作</option>{Object.entries(operationLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><select value={currencyFilter} onChange={(event) => setCurrencyFilter(event.target.value)}><option value="all">全部币种</option><option value="CNY">人民币</option><option value="USD">美元</option></select><select value={institutionFilter} onChange={(event) => setInstitutionFilter(event.target.value)}><option value="all">全部银行</option>{institutions.map((institution) => <option key={institution} value={institution}>{institution}</option>)}</select><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">全部状态</option><option value="effective">有效流水</option><option value="reversed">冲销记录</option><option value="review">待核对</option></select><label className="date-filter">从<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /></label><label className="date-filter">至<input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /></label></div>
       <div className="table-scroll"><table><thead><tr><th>日期</th><th>操作</th><th>产品</th><th>币种</th><th className="number">现金金额</th><th className="number">核销成本</th><th className="number">已实现收益</th><th>备注</th></tr></thead><tbody>
-        {transactions.map((item) => {
+        {filtered.map((item) => {
           const incoming = ["SELL", "REDEEM", "PRODUCT_MATURITY", "DEPOSIT_MATURITY", "DIVIDEND"].includes(item.operation);
           const cashless = item.operation === "VALUATION";
           const neutral = ["REVERSAL", "TRANSFER"].includes(item.operation);
           const reversed = item.reversedBy !== null;
           const hasRealized = (incoming || item.operation === "FEE" || item.operation === "REVERSAL") && (item.operation !== "REDEEM" || Math.abs(item.realizedGain) > 0.000001);
-          return <tr className={`transaction-row ${reversed ? "reversed-row" : ""}`} key={item.id} onClick={() => onSelect(item.id)} aria-busy={loading}><td className="nowrap">{item.tradeDate}</td><td><span className={`operation-tag ${neutral ? "neutral" : incoming ? "incoming" : "outgoing"}`}>{operationLabels[item.operation] ?? item.operation}</span>{reversed && <span className="reversed-label">已冲销</span>}</td><td><strong>{item.title}</strong>{item.code && <span>{item.code}</span>}</td><td>{item.currency}</td><td className={`number ${incoming ? "gain" : ""}`}>{cashless ? "—" : <>{incoming ? "+" : neutral ? "↔" : "-"}{formatMoney(item.amount, item.currency)}</>}</td><td className="number">{Math.abs(item.costBasis) > 0.000001 ? formatMoney(item.costBasis, item.currency) : "—"}</td><td className={`number ${item.realizedGain >= 0 ? "gain" : "loss"}`}>{hasRealized ? formatMoney(item.realizedGain, item.currency) : "—"}</td><td className="note-cell">{item.note ?? "—"}</td></tr>;
+          return <tr className={`transaction-row ${reversed ? "reversed-row" : ""}`} key={item.id} onClick={() => onSelect(item.id)} aria-busy={loading}><td className="nowrap">{item.tradeDate}</td><td><span className={`operation-tag ${neutral ? "neutral" : incoming ? "incoming" : "outgoing"}`}>{operationLabels[item.operation] ?? item.operation}</span>{reversed && <span className="reversed-label">已冲销</span>}</td><td><strong>{item.title}</strong><span>{[item.code, item.institution].filter(Boolean).join(" · ")}</span></td><td>{item.currency}</td><td className={`number ${incoming ? "gain" : ""}`}>{cashless ? "—" : <>{incoming ? "+" : neutral ? "↔" : "-"}{formatMoney(item.amount, item.currency)}</>}</td><td className="number">{Math.abs(item.costBasis) > 0.000001 ? formatMoney(item.costBasis, item.currency) : "—"}</td><td className={`number ${item.realizedGain >= 0 ? "gain" : "loss"}`}>{hasRealized ? formatMoney(item.realizedGain, item.currency) : "—"}</td><td className="note-cell">{item.note ?? "—"}</td></tr>;
         })}
+        {!filtered.length && <tr><td colSpan={8}><div className="table-empty">没有符合当前筛选条件的流水</div></td></tr>}
       </tbody></table></div>
     </article>
   );
