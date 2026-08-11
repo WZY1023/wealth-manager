@@ -123,6 +123,33 @@ struct HoldingDetail {
     history: Vec<ValuationHistoryPoint>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClosedPosition {
+    id: i64,
+    product_id: i64,
+    account_id: i64,
+    name: String,
+    code: String,
+    institution: String,
+    currency: String,
+    purchase_date: Option<String>,
+    close_date: String,
+    holding_days: Option<i64>,
+    invested_cost: f64,
+    proceeds: f64,
+    dividends: f64,
+    fees: f64,
+    realized_gain: f64,
+    return_rate: f64,
+    annualized_return: Option<f64>,
+    close_type: String,
+    source: String,
+    needs_review: bool,
+    buy_count: i64,
+    exit_count: i64,
+}
+
 struct HoldingInsight {
     days_since_valuation: i64,
     seven_day_return: Option<f64>,
@@ -5638,6 +5665,218 @@ fn record_entry(input: EntryInput, state: State<'_, AppState>) -> Result<EntryRe
     apply_entry(&mut conn, &input)
 }
 
+fn list_closed_positions_from_conn(conn: &Connection) -> Result<Vec<ClosedPosition>, String> {
+    type ClosingRow = (
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    );
+
+    let closings = {
+        let mut statement = conn
+            .prepare(
+                "SELECT t.id, t.product_id, t.account_id, p.name, p.code, a.institution,
+                        t.currency, t.transaction_type, t.trade_date, t.source, t.note
+                 FROM transactions t
+                 JOIN products p ON p.id = t.product_id
+                 JOIN accounts a ON a.id = t.account_id
+                 WHERE t.reversed_by IS NULL
+                   AND (
+                     t.transaction_type IN ('REDEEM', 'PRODUCT_MATURITY')
+                     OR (t.transaction_type = 'SELL' AND t.valuation_after IS NOT NULL
+                         AND t.valuation_after <= 0.000001)
+                   )
+                 ORDER BY t.product_id, t.account_id, t.trade_date, t.id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<ClosingRow>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+
+    let mut previous_closings: HashMap<(i64, i64), (String, i64)> = HashMap::new();
+    let mut positions = Vec::with_capacity(closings.len());
+    for (
+        id,
+        product_id,
+        account_id,
+        name,
+        code,
+        institution,
+        currency,
+        close_type,
+        close_date,
+        source,
+        note,
+    ) in closings
+    {
+        let previous = previous_closings.get(&(product_id, account_id));
+        let previous_date = previous.map(|item| item.0.as_str());
+        let previous_id = previous.map(|item| item.1);
+        let (invested_cost, proceeds, dividends, fees, realized_gain, exit_count): (
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT
+                   COALESCE(SUM(CASE WHEN t.transaction_type IN ('SELL', 'REDEEM', 'PRODUCT_MATURITY') THEN t.cost_basis ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN t.transaction_type IN ('SELL', 'REDEEM', 'PRODUCT_MATURITY') THEN t.amount ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN t.transaction_type = 'DIVIDEND' THEN t.amount ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN t.transaction_type = 'FEE' THEN t.amount ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN t.transaction_type IN ('SELL', 'REDEEM', 'PRODUCT_MATURITY', 'DIVIDEND', 'FEE') THEN t.realized_gain ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN t.transaction_type IN ('SELL', 'REDEEM', 'PRODUCT_MATURITY') THEN 1 ELSE 0 END), 0)
+                 FROM transactions t
+                 WHERE t.product_id = ?1 AND t.account_id = ?2
+                   AND t.reversed_by IS NULL AND t.transaction_type != 'REVERSAL'
+                   AND (?3 IS NULL OR t.trade_date > ?3 OR (t.trade_date = ?3 AND t.id > COALESCE(?4, 0)))
+                   AND (t.trade_date < ?5 OR (t.trade_date = ?5 AND t.id <= ?6))",
+                params![
+                    product_id,
+                    account_id,
+                    previous_date,
+                    previous_id,
+                    close_date,
+                    id
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        let (mut purchase_date, mut buy_count): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT MIN(l.purchase_date), COUNT(DISTINCT l.id)
+                 FROM transaction_lot_allocations allocation
+                 JOIN transactions exit ON exit.id = allocation.transaction_id
+                 JOIN position_lots l ON l.id = allocation.lot_id
+                 WHERE exit.product_id = ?1 AND exit.account_id = ?2
+                   AND exit.reversed_by IS NULL
+                   AND (?3 IS NULL OR exit.trade_date > ?3 OR (exit.trade_date = ?3 AND exit.id > COALESCE(?4, 0)))
+                   AND (exit.trade_date < ?5 OR (exit.trade_date = ?5 AND exit.id <= ?6))",
+                params![
+                    product_id,
+                    account_id,
+                    previous_date,
+                    previous_id,
+                    close_date,
+                    id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        if buy_count == 0 {
+            (purchase_date, buy_count) = conn
+                .query_row(
+                    "SELECT MIN(purchase_date), COUNT(*)
+                     FROM position_lots
+                     WHERE product_id = ?1 AND account_id = ?2
+                       AND source = 'excel' AND status = 'closed' AND end_date IS NOT NULL
+                       AND end_date <= ?3 AND (?4 IS NULL OR end_date > ?4)",
+                    params![product_id, account_id, close_date, previous_date],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
+        let holding_days = purchase_date.as_deref().and_then(|date| {
+            let start = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+            let end = NaiveDate::parse_from_str(&close_date, "%Y-%m-%d").ok()?;
+            Some(end.signed_duration_since(start).num_days().max(0))
+        });
+        let return_rate = if invested_cost.abs() > 0.000_001 {
+            realized_gain / invested_cost
+        } else {
+            0.0
+        };
+        let annualized_return = holding_days.and_then(|days| {
+            let growth = 1.0 + return_rate;
+            (days > 0 && invested_cost > 0.000_001 && growth > 0.0)
+                .then(|| growth.powf(365.0 / days as f64) - 1.0)
+        });
+        let needs_review = note
+            .as_deref()
+            .is_some_and(|value| value.contains("待核对"));
+        positions.push(ClosedPosition {
+            id,
+            product_id,
+            account_id,
+            name,
+            code,
+            institution,
+            currency,
+            purchase_date,
+            close_date: close_date.clone(),
+            holding_days,
+            invested_cost,
+            proceeds,
+            dividends,
+            fees,
+            realized_gain,
+            return_rate,
+            annualized_return,
+            close_type,
+            source,
+            needs_review,
+            buy_count,
+            exit_count,
+        });
+        previous_closings.insert((product_id, account_id), (close_date, id));
+    }
+    positions.sort_by(|left, right| {
+        right
+            .close_date
+            .cmp(&left.close_date)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(positions)
+}
+
+#[tauri::command]
+fn list_closed_positions(state: State<'_, AppState>) -> Result<Vec<ClosedPosition>, String> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    list_closed_positions_from_conn(&conn)
+}
+
 #[tauri::command]
 fn list_transactions(state: State<'_, AppState>) -> Result<Vec<TransactionRecord>, String> {
     let conn = state
@@ -5845,6 +6084,7 @@ pub fn run() {
             record_batch_valuations,
             get_holding_detail,
             list_maturities,
+            list_closed_positions,
             record_entry,
             list_transactions,
             get_transaction_detail,
@@ -6199,6 +6439,55 @@ mod tests {
             )
             .expect("active lots");
         assert_eq!(active_lots, 0);
+    }
+
+    #[test]
+    fn closed_position_history_aggregates_partial_sales_until_final_exit() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        apply_entry(&mut conn, &entry("BUY", 10_000.0)).expect("first buy");
+        apply_entry(&mut conn, &entry("BUY", 5_000.0)).expect("second buy");
+
+        let (product, account): (i64, i64) = conn
+            .query_row(
+                "SELECT product_id, account_id FROM position_lots LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("holding identifiers");
+        let mut valuation = entry("VALUATION", 0.0);
+        valuation.product_id = Some(product);
+        valuation.account_id = Some(account);
+        valuation.market_value = Some(16_500.0);
+        apply_entry(&mut conn, &valuation).expect("valuation");
+
+        let mut partial = entry("SELL", 5_500.0);
+        partial.product_id = Some(product);
+        partial.account_id = Some(account);
+        partial.trade_date = "2026-08-08".to_string();
+        apply_entry(&mut conn, &partial).expect("partial sale");
+        assert!(list_closed_positions_from_conn(&conn)
+            .expect("history before closure")
+            .is_empty());
+
+        let mut final_sale = entry("SELL", 11_000.0);
+        final_sale.product_id = Some(product);
+        final_sale.account_id = Some(account);
+        final_sale.trade_date = "2026-08-09".to_string();
+        apply_entry(&mut conn, &final_sale).expect("final sale");
+
+        let history = list_closed_positions_from_conn(&conn).expect("closed history");
+        assert_eq!(history.len(), 1);
+        let item = &history[0];
+        assert_eq!(item.purchase_date.as_deref(), Some("2026-08-07"));
+        assert_eq!(item.close_date, "2026-08-09");
+        assert_eq!(item.holding_days, Some(2));
+        assert_eq!(item.buy_count, 2);
+        assert_eq!(item.exit_count, 2);
+        assert!((item.invested_cost - 15_000.0).abs() < 0.01);
+        assert!((item.proceeds - 16_500.0).abs() < 0.01);
+        assert!((item.realized_gain - 1_500.0).abs() < 0.01);
+        assert!((item.return_rate - 0.1).abs() < 0.000_001);
     }
 
     #[test]
