@@ -36,8 +36,19 @@ import "./App.css";
 type View = "overview" | "holdings" | "history" | "transactions" | "calendar" | "analytics" | "masterData" | "reconciliation";
 type CurrencyCode = "CNY" | "USD";
 type EntryOperation = "BUY" | "SELL" | "PRODUCT_MATURITY" | "VALUATION" | "DIVIDEND" | "FEE" | "TRANSFER" | "DEPOSIT_OPEN" | "DEPOSIT_MATURITY";
-type ProductSortKey = "name" | "code" | "riskLevel";
 type SortDirection = "asc" | "desc";
+type SortState<Key extends string> = { key: Key; direction: SortDirection };
+type SortValue = string | number | boolean | null | undefined;
+
+type HoldingsSortKey = "productName" | "productCode" | "channel" | "cost" | "marketValue" | "gain" | "thirtyDayReturn" | "valuationDate" | "signal";
+type HistorySortKey = "productName" | "productCode" | "closeType" | "holdingDays" | "investedCost" | "proceeds" | "dividendFees" | "realizedGain" | "returnRate";
+type ProductSortKey = "name" | "code" | "currency" | "issuer" | "purchaseBanks" | "riskLevel" | "source";
+type AccountSortKey = "account" | "currency" | "source";
+type DepositSortKey = "name" | "institution" | "currency" | "principal" | "maturityDate" | "annualRate" | "status";
+type ReconciliationSortKey = "institution" | "usdCnyRate" | "trackedWealthCny" | "actualWealthCny" | "trackedDepositCny" | "actualDepositCny" | "demandCny" | "actualTotalCny" | "status";
+type TransactionSortKey = "tradeDate" | "operation" | "productName" | "productCode" | "currency" | "amount" | "costBasis" | "realizedGain" | "note";
+type BatchValuationSortKey = "productName" | "productCode" | "marketValue" | "nextMarketValue" | "difference";
+type ValuationHistorySortKey = "date" | "marketValue" | "changeRate" | "source";
 
 type CurrencySummary = {
   currency: CurrencyCode;
@@ -82,7 +93,7 @@ type Holding = {
 };
 
 type ValuationHistoryPoint = { id: number; date: string; marketValue: number; changeAmount: number | null; changeRate: number | null; source: string };
-type HoldingDetail = Omit<Holding, "id" | "status"> & { history: ValuationHistoryPoint[] };
+type HoldingDetail = Omit<Holding, "id" | "status"> & { riskLevel: string | null; history: ValuationHistoryPoint[] };
 type ClosedPosition = {
   id: number;
   productId: number;
@@ -253,6 +264,63 @@ function formatPercent(value: number) {
   return new Intl.NumberFormat("zh-CN", { style: "percent", maximumFractionDigits: 2 }).format(value);
 }
 
+const sortCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+
+function toggleSort<Key extends string>(current: SortState<Key> | null, key: Key): SortState<Key> {
+  return current?.key === key
+    ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+    : { key, direction: "asc" };
+}
+
+function cycleProductSort<Key extends string>(current: SortState<Key> | null, nameKey: Key, codeKey: Key): SortState<Key> {
+  if (current?.key === nameKey) {
+    return current.direction === "asc" ? { key: nameKey, direction: "desc" } : { key: codeKey, direction: "asc" };
+  }
+  if (current?.key === codeKey) {
+    return current.direction === "asc" ? { key: codeKey, direction: "desc" } : { key: nameKey, direction: "asc" };
+  }
+  return { key: nameKey, direction: "asc" };
+}
+
+function sortRows<Item, Key extends string>(items: Item[], sort: SortState<Key> | null, getValue: (item: Item, key: Key) => SortValue) {
+  if (!sort) return items;
+  const multiplier = sort.direction === "asc" ? 1 : -1;
+  return items.map((item, index) => ({ item, index })).sort((left, right) => {
+    const leftValue = getValue(left.item, sort.key);
+    const rightValue = getValue(right.item, sort.key);
+    const leftMissing = leftValue === null || leftValue === undefined || leftValue === "";
+    const rightMissing = rightValue === null || rightValue === undefined || rightValue === "";
+    if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+    if (leftMissing && rightMissing) return left.index - right.index;
+    const comparison = typeof leftValue === "number" && typeof rightValue === "number"
+      ? leftValue - rightValue
+      : sortCollator.compare(String(leftValue), String(rightValue));
+    return comparison === 0 ? left.index - right.index : comparison * multiplier;
+  }).map(({ item }) => item);
+}
+
+function SortableHeader({ label, active, direction, onSort, className, activeDetail }: {
+  label: string;
+  active: boolean;
+  direction: SortDirection;
+  onSort: () => void;
+  className?: string;
+  activeDetail?: string;
+}) {
+  return <th className={className} aria-sort={active ? direction === "asc" ? "ascending" : "descending" : "none"}><SortControl label={label} active={active} direction={direction} onSort={onSort} activeDetail={activeDetail} /></th>;
+}
+
+function SortControl({ label, active, direction, onSort, activeDetail }: {
+  label: string;
+  active: boolean;
+  direction: SortDirection;
+  onSort: () => void;
+  activeDetail?: string;
+}) {
+  const sortLabel = active ? `${activeDetail ? `${activeDetail}、` : ""}${direction === "asc" ? "升序" : "降序"}` : "未排序";
+  return <button className={`sortable-header ${active ? "active" : ""}`} type="button" onClick={onSort} title={`${label}：${sortLabel}`}><span>{label}</span>{activeDetail && active && <small>{activeDetail}</small>}{active ? direction === "asc" ? <ArrowUp /> : <ArrowDown /> : <span className="sort-placeholder">↕</span>}</button>;
+}
+
 type DateInputProps = {
   value: string;
   onChange: (value: string) => void;
@@ -363,12 +431,22 @@ function App() {
 
   useEffect(() => {
     const blockNumberWheel = (event: WheelEvent) => {
-      const target = event.target;
-      if (target instanceof HTMLInputElement && target.type === "number" && document.activeElement === target) {
-        event.preventDefault();
-      }
+      const activeElement = document.activeElement;
+      if (!(activeElement instanceof HTMLInputElement) || activeElement.type !== "number") return;
+
+      const bounds = activeElement.getBoundingClientRect();
+      const pointerIsInsideInput =
+        event.clientX >= bounds.left &&
+        event.clientX <= bounds.right &&
+        event.clientY >= bounds.top &&
+        event.clientY <= bounds.bottom;
+
+      // A focused native number input applies the wheel delta as a value step.
+      // Blurring it before the default action keeps the value stable while still
+      // allowing the surrounding page or dialog to scroll normally.
+      if (pointerIsInsideInput) activeElement.blur();
     };
-    document.addEventListener("wheel", blockNumberWheel, { capture: true, passive: false });
+    document.addEventListener("wheel", blockNumberWheel, { capture: true });
     return () => document.removeEventListener("wheel", blockNumberWheel, { capture: true });
   }, []);
 
@@ -811,6 +889,7 @@ function HoldingsView({ holdings, onBatchUpdate, onSelect, loading }: { holdings
   const [currencyFilter, setCurrencyFilter] = useState("all");
   const [channelFilter, setChannelFilter] = useState("all");
   const [signalFilter, setSignalFilter] = useState("all");
+  const [sort, setSort] = useState<SortState<HoldingsSortKey> | null>(null);
   const channels = useMemo(() => [...new Set(holdings.map((item) => item.channel))].sort(), [holdings]);
   const filtered = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
@@ -822,12 +901,27 @@ function HoldingsView({ holdings, onBatchUpdate, onSelect, loading }: { holdings
       return matchesKeyword && matchesCurrency && matchesChannel && matchesSignal;
     });
   }, [holdings, searchText, currencyFilter, channelFilter, signalFilter]);
+  const sorted = useMemo(() => sortRows(filtered, sort, (item, key) => {
+    switch (key) {
+      case "productName": return item.name;
+      case "productCode": return item.code;
+      case "channel": return item.channel;
+      case "cost": return item.cost;
+      case "marketValue": return item.marketValue;
+      case "gain": return item.gain;
+      case "thirtyDayReturn": return item.thirtyDayReturn;
+      case "valuationDate": return item.valuationDate;
+      case "signal": return item.signalLabel;
+    }
+  }), [filtered, sort]);
+  const productSortActive = sort?.key === "productName" || sort?.key === "productCode";
+  const changeSort = (key: HoldingsSortKey) => setSort((current) => toggleSort(current, key));
   return (
     <article className="panel table-panel">
       <div className="panel-header holdings-header"><div><h2>当前持仓</h2><span>显示 {filtered.length}/{holdings.length} 个产品 · 点击持仓查看市值与收益历史</span></div><button className="button primary valuation-cta" type="button" onClick={onBatchUpdate}><Activity />批量更新市值</button></div>
       <div className="filter-bar holdings-filter"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索产品、代码或渠道" /></label><select value={currencyFilter} onChange={(event) => setCurrencyFilter(event.target.value)}><option value="all">全部币种</option><option value="CNY">人民币</option><option value="USD">美元</option></select><select value={channelFilter} onChange={(event) => setChannelFilter(event.target.value)}><option value="all">全部渠道</option>{channels.map((channel) => <option key={channel} value={channel}>{channel}</option>)}</select><select value={signalFilter} onChange={(event) => setSignalFilter(event.target.value)}><option value="all">全部参考</option><option value="stale">市值待更新</option><option value="REVIEW">评估赎回</option><option value="TAKE_PROFIT">考虑止盈</option><option value="ADD_WATCH">关注加仓</option><option value="HOLD">继续观察</option><option value="OBSERVE">积累数据</option></select></div>
-      <div className="table-scroll"><table className="holdings-table"><thead><tr><th>产品</th><th>渠道</th><th className="number">成本</th><th className="number">市值</th><th className="number">持有收益</th><th className="number">近30日</th><th>最近更新</th><th>操作参考</th></tr></thead><tbody>
-        {filtered.map((item) => <tr className="holding-row" aria-busy={loading} key={`${item.id}-${item.currency}`} onClick={() => onSelect(item)}><td><strong>{item.name}</strong><span>{item.code} · {item.currency}</span></td><td>{item.channel}</td><td className="number">{formatMoney(item.cost, item.currency)}</td><td className="number"><strong>{formatMoney(item.marketValue, item.currency)}</strong></td><td className={`number ${item.gain >= 0 ? "gain" : "loss"}`}>{formatMoney(item.gain, item.currency)}<span>{formatPercent(item.gainRate)}</span></td><td className={`number ${item.thirtyDayReturn === null ? "" : item.thirtyDayReturn >= 0 ? "gain" : "loss"}`}>{item.thirtyDayReturn === null ? "—" : formatPercent(item.thirtyDayReturn)}</td><td><span className={item.daysSinceValuation > 10 ? "stale-date" : "fresh-date"}>{item.valuationDate}</span><small>{item.daysSinceValuation === 0 ? "今天" : `${item.daysSinceValuation}天前`}</small></td><td><span className={`signal-badge signal-${item.signal.toLowerCase()}`}>{item.signalLabel}</span><small className="signal-summary">{item.signalReason}</small></td></tr>)}
+      <div className="table-scroll"><table className="holdings-table"><thead><tr><SortableHeader label="产品" active={productSortActive} direction={sort?.direction ?? "asc"} activeDetail={sort?.key === "productCode" ? "代码" : "名称"} onSort={() => setSort((current) => cycleProductSort(current, "productName", "productCode"))} /><SortableHeader label="渠道" active={sort?.key === "channel"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("channel")} /><SortableHeader label="成本" className="number" active={sort?.key === "cost"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("cost")} /><SortableHeader label="市值" className="number" active={sort?.key === "marketValue"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("marketValue")} /><SortableHeader label="持有收益" className="number" active={sort?.key === "gain"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("gain")} /><SortableHeader label="近30日" className="number" active={sort?.key === "thirtyDayReturn"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("thirtyDayReturn")} /><SortableHeader label="最近更新" active={sort?.key === "valuationDate"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("valuationDate")} /><SortableHeader label="操作参考" active={sort?.key === "signal"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("signal")} /></tr></thead><tbody>
+        {sorted.map((item) => <tr className="holding-row" aria-busy={loading} key={`${item.id}-${item.currency}`} onClick={() => onSelect(item)}><td><strong>{item.name}</strong><span>{item.code} · {item.currency}</span></td><td>{item.channel}</td><td className="number">{formatMoney(item.cost, item.currency)}</td><td className="number"><strong>{formatMoney(item.marketValue, item.currency)}</strong></td><td className={`number ${item.gain >= 0 ? "gain" : "loss"}`}>{formatMoney(item.gain, item.currency)}<span>{formatPercent(item.gainRate)}</span></td><td className={`number ${item.thirtyDayReturn === null ? "" : item.thirtyDayReturn >= 0 ? "gain" : "loss"}`}>{item.thirtyDayReturn === null ? "—" : formatPercent(item.thirtyDayReturn)}</td><td><span className={item.daysSinceValuation > 10 ? "stale-date" : "fresh-date"}>{item.valuationDate}</span><small>{item.daysSinceValuation === 0 ? "今天" : `${item.daysSinceValuation}天前`}</small></td><td><span className={`signal-badge signal-${item.signal.toLowerCase()}`}>{item.signalLabel}</span><small className="signal-summary">{item.signalReason}</small></td></tr>)}
       </tbody></table></div>
       <div className="advice-disclaimer"><Sparkles />操作参考仅根据你记录的估值、收益、产品风险等级和持仓占比生成；历史表现不能预测未来，请同时核对期限、赎回规则、费用和个人风险承受能力。</div>
     </article>
@@ -846,6 +940,7 @@ function HistoryView({ positions, onSelect }: { positions: ClosedPosition[]; onS
   const [institutionFilter, setInstitutionFilter] = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
   const [yearFilter, setYearFilter] = useState("all");
+  const [sort, setSort] = useState<SortState<HistorySortKey> | null>(null);
   const institutions = useMemo(() => [...new Set(positions.map((item) => item.institution))].sort(), [positions]);
   const years = useMemo(() => [...new Set(positions.map((item) => item.closeDate.slice(0, 4)))].sort().reverse(), [positions]);
   const filtered = useMemo(() => {
@@ -859,6 +954,21 @@ function HistoryView({ positions, onSelect }: { positions: ClosedPosition[]; onS
       return matchesKeyword && matchesCurrency && matchesInstitution && matchesType && matchesYear;
     });
   }, [positions, searchText, currencyFilter, institutionFilter, typeFilter, yearFilter]);
+  const sorted = useMemo(() => sortRows(filtered, sort, (item, key) => {
+    switch (key) {
+      case "productName": return item.name;
+      case "productCode": return item.code;
+      case "closeType": return closedPositionLabels[item.closeType];
+      case "holdingDays": return item.holdingDays;
+      case "investedCost": return item.investedCost;
+      case "proceeds": return item.proceeds;
+      case "dividendFees": return item.dividends - item.fees;
+      case "realizedGain": return item.realizedGain;
+      case "returnRate": return item.returnRate;
+    }
+  }), [filtered, sort]);
+  const productSortActive = sort?.key === "productName" || sort?.key === "productCode";
+  const changeSort = (key: HistorySortKey) => setSort((current) => toggleSort(current, key));
   const cnyGain = filtered.filter((item) => item.currency === "CNY").reduce((sum, item) => sum + item.realizedGain, 0);
   const usdGain = filtered.filter((item) => item.currency === "USD").reduce((sum, item) => sum + item.realizedGain, 0);
   const profitable = filtered.filter((item) => item.realizedGain > 0.000001).length;
@@ -873,8 +983,8 @@ function HistoryView({ positions, onSelect }: { positions: ClosedPosition[]; onS
       <article className="panel table-panel history-panel">
         <div className="panel-header"><div><h2>已清仓 / 已到期</h2><span>显示 {filtered.length}/{positions.length} 笔 · 点击查看完整信息</span></div></div>
         <div className="filter-bar history-filter"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索产品、代码或银行" /></label><select value={currencyFilter} onChange={(event) => setCurrencyFilter(event.target.value)}><option value="all">全部币种</option><option value="CNY">人民币</option><option value="USD">美元</option></select><select value={institutionFilter} onChange={(event) => setInstitutionFilter(event.target.value)}><option value="all">全部银行</option>{institutions.map((institution) => <option key={institution} value={institution}>{institution}</option>)}</select><select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}><option value="all">全部方式</option>{Object.entries(closedPositionLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><select value={yearFilter} onChange={(event) => setYearFilter(event.target.value)}><option value="all">全部年份</option>{years.map((year) => <option key={year} value={year}>{year} 年</option>)}</select></div>
-        <div className="table-scroll"><table className="history-position-table"><thead><tr><th>产品</th><th>结清方式</th><th>持有期间</th><th className="number">投入成本</th><th className="number">赎回到账</th><th className="number">分红 / 费用</th><th className="number">已实现收益</th><th className="number">收益率 / 年化</th></tr></thead><tbody>
-          {filtered.map((item) => <tr className="history-row" key={item.id} onClick={() => onSelect(item)}><td><strong>{item.name}</strong><span>{item.code} · {item.institution} · {item.currency}</span></td><td><span className="status">{closedPositionLabels[item.closeType]}</span>{item.needsReview && <small className="review-label">待核对</small>}</td><td className="history-period"><strong>{item.purchaseDate ?? "—"} → {item.closeDate}</strong><span>{item.holdingDays === null ? "持有天数待补全" : `持有 ${item.holdingDays} 天`}</span></td><td className="number">{formatMoney(item.investedCost, item.currency)}</td><td className="number">{formatMoney(item.proceeds, item.currency)}</td><td className="number"><strong>{formatMoney(item.dividends, item.currency)}</strong><span className={item.fees > 0 ? "loss" : ""}>{item.fees > 0 ? `- ${formatMoney(item.fees, item.currency)}` : "—"}</span></td><td className={`number ${item.realizedGain >= 0 ? "gain" : "loss"}`}><strong>{formatMoney(item.realizedGain, item.currency)}</strong></td><td className={`number ${item.returnRate >= 0 ? "gain" : "loss"}`}><strong>{formatPercent(item.returnRate)}</strong><span>{item.annualizedReturn === null ? "年化—" : `年化 ${formatPercent(item.annualizedReturn)}`}</span></td></tr>)}
+        <div className="table-scroll"><table className="history-position-table"><thead><tr><SortableHeader label="产品" active={productSortActive} direction={sort?.direction ?? "asc"} activeDetail={sort?.key === "productCode" ? "代码" : "名称"} onSort={() => setSort((current) => cycleProductSort(current, "productName", "productCode"))} /><SortableHeader label="结清方式" active={sort?.key === "closeType"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("closeType")} /><SortableHeader label="持有期间" active={sort?.key === "holdingDays"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("holdingDays")} /><SortableHeader label="投入成本" className="number" active={sort?.key === "investedCost"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("investedCost")} /><SortableHeader label="赎回到账" className="number" active={sort?.key === "proceeds"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("proceeds")} /><SortableHeader label="分红 / 费用" className="number" active={sort?.key === "dividendFees"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("dividendFees")} /><SortableHeader label="已实现收益" className="number" active={sort?.key === "realizedGain"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("realizedGain")} /><SortableHeader label="收益率 / 年化" className="number" active={sort?.key === "returnRate"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("returnRate")} /></tr></thead><tbody>
+          {sorted.map((item) => <tr className="history-row" key={item.id} onClick={() => onSelect(item)}><td><strong>{item.name}</strong><span>{item.code} · {item.institution} · {item.currency}</span></td><td><span className="status">{closedPositionLabels[item.closeType]}</span>{item.needsReview && <small className="review-label">待核对</small>}</td><td className="history-period"><strong>{item.purchaseDate ?? "—"} → {item.closeDate}</strong><span>{item.holdingDays === null ? "持有天数待补全" : `持有 ${item.holdingDays} 天`}</span></td><td className="number">{formatMoney(item.investedCost, item.currency)}</td><td className="number">{formatMoney(item.proceeds, item.currency)}</td><td className="number"><strong>{formatMoney(item.dividends, item.currency)}</strong><span className={item.fees > 0 ? "loss" : ""}>{item.fees > 0 ? `- ${formatMoney(item.fees, item.currency)}` : "—"}</span></td><td className={`number ${item.realizedGain >= 0 ? "gain" : "loss"}`}><strong>{formatMoney(item.realizedGain, item.currency)}</strong></td><td className={`number ${item.returnRate >= 0 ? "gain" : "loss"}`}><strong>{formatPercent(item.returnRate)}</strong><span>{item.annualizedReturn === null ? "年化—" : `年化 ${formatPercent(item.annualizedReturn)}`}</span></td></tr>)}
           {!filtered.length && <tr><td colSpan={8}><div className="table-empty">没有符合条件的历史理财</div></td></tr>}
         </tbody></table></div>
       </article>
@@ -905,23 +1015,22 @@ function ClosedPositionDetailModal({ detail, onClose }: { detail: ClosedPosition
 
 function BatchValuationModal({ holdings, onClose, onSave }: { holdings: Holding[]; onClose: () => void; onSave: (input: BatchValuationInput) => Promise<void> }) {
   const today = new Date().toISOString().slice(0, 10);
-  const sortedHoldings = useMemo(() => {
-    const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
-    return [...holdings].sort((left, right) => {
-      const leftCode = left.code.trim();
-      const rightCode = right.code.trim();
-      if (!leftCode && rightCode) return 1;
-      if (leftCode && !rightCode) return -1;
-      const byCode = collator.compare(leftCode, rightCode);
-      if (byCode !== 0) return byCode;
-      const byChannel = collator.compare(left.channel, right.channel);
-      return byChannel !== 0 ? byChannel : left.accountId - right.accountId;
-    });
-  }, [holdings]);
   const [valuationDate, setValuationDate] = useState(today);
   const [note, setNote] = useState("");
-  const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(sortedHoldings.map((item) => [`${item.productId}:${item.accountId}`, item.marketValue.toString()])));
+  const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(holdings.map((item) => [`${item.productId}:${item.accountId}`, item.marketValue.toString()])));
   const [submitting, setSubmitting] = useState(false);
+  const [sort, setSort] = useState<SortState<BatchValuationSortKey>>({ key: "productCode", direction: "asc" });
+  const sortedHoldings = useMemo(() => sortRows(holdings, sort, (item, key) => {
+    const valueKey = `${item.productId}:${item.accountId}`;
+    const nextValue = Number(values[valueKey]);
+    switch (key) {
+      case "productName": return item.name;
+      case "productCode": return item.code;
+      case "marketValue": return item.marketValue;
+      case "nextMarketValue": return Number.isFinite(nextValue) ? nextValue : null;
+      case "difference": return Number.isFinite(nextValue) ? nextValue - item.marketValue : null;
+    }
+  }), [holdings, sort, values]);
   const changed = sortedHoldings.filter((item) => {
     const next = Number(values[`${item.productId}:${item.accountId}`]);
     return Number.isFinite(next) && Math.abs(next - item.marketValue) > 0.000001;
@@ -951,7 +1060,7 @@ function BatchValuationModal({ holdings, onClose, onSave }: { holdings: Holding[
         <div className="modal-header"><div><h2 id="batch-title">批量更新市值</h2><p>一次完成全部持仓的周度估值；未变化的数值也会留下本次确认记录</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
         <form onSubmit={(event) => void submit(event)}>
           <div className="batch-meta"><label>估值日期<DateInput required ariaLabel="估值日期" value={valuationDate} onChange={setValuationDate} /></label><label>备注（可选）<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="例如：周末统一更新" /></label></div>
-          <div className="batch-list"><div className="batch-list-head"><span>产品、代码与渠道</span><span>原市值</span><span>本次市值</span><span>变化</span></div>{sortedHoldings.map((item) => {
+          <div className="batch-list"><div className="batch-list-head"><SortControl label="产品、代码与渠道" active={sort.key === "productName" || sort.key === "productCode"} direction={sort.direction} activeDetail={sort.key === "productCode" ? "代码" : "名称"} onSort={() => setSort((current) => cycleProductSort(current, "productName", "productCode"))} /><SortControl label="原市值" active={sort.key === "marketValue"} direction={sort.direction} onSort={() => setSort((current) => toggleSort(current, "marketValue"))} /><SortControl label="本次市值" active={sort.key === "nextMarketValue"} direction={sort.direction} onSort={() => setSort((current) => toggleSort(current, "nextMarketValue"))} /><SortControl label="变化" active={sort.key === "difference"} direction={sort.direction} onSort={() => setSort((current) => toggleSort(current, "difference"))} /></div>{sortedHoldings.map((item) => {
             const key = `${item.productId}:${item.accountId}`;
             const next = Number(values[key]);
             const difference = Number.isFinite(next) ? next - item.marketValue : 0;
@@ -964,35 +1073,90 @@ function BatchValuationModal({ holdings, onClose, onSave }: { holdings: Holding[
   );
 }
 
+function niceChartStep(range: number, targetIntervals: number) {
+  const roughStep = range / Math.max(targetIntervals, 1);
+  const magnitude = 10 ** Math.floor(Math.log10(Math.max(roughStep, Number.EPSILON)));
+  const normalized = roughStep / magnitude;
+  const factors = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+  const factor = factors.reduce((closest, candidate) => Math.abs(Math.log(candidate / normalized)) < Math.abs(Math.log(closest / normalized)) ? candidate : closest);
+  return factor * magnitude;
+}
+
 function ValuationHistoryChart({ points, currency }: { points: ValuationHistoryPoint[]; currency: CurrencyCode }) {
   const visible = points.slice(-24);
   if (visible.length < 2) return <div className="history-empty">至少完成两次市值记录后显示变化曲线</div>;
   const width = 760;
   const height = 230;
-  const padX = 28;
+  const padLeft = 62;
+  const padRight = 28;
   const padTop = 18;
   const padBottom = 34;
   const values = visible.map((item) => item.marketValue);
   const min = Math.min(...values);
   const max = Math.max(...values);
-  const padding = Math.max((max - min) * 0.12, max * 0.005, 1);
-  const low = min - padding;
-  const high = max + padding;
-  const x = (index: number) => padX + index * ((width - padX * 2) / Math.max(visible.length - 1, 1));
+  const valueRange = max - min;
+  const valueMagnitude = Math.max(Math.abs(min), Math.abs(max), 1);
+  const padding = valueRange > 0
+    ? Math.max(valueRange * 0.08, valueMagnitude * 0.00001, 0.01)
+    : Math.max(valueMagnitude * 0.001, 1);
+  const yStep = niceChartStep(valueRange + padding * 2, 7);
+  const low = Math.floor((min - padding) / yStep) * yStep;
+  const high = Math.ceil((max + padding) / yStep) * yStep;
+  const yTicks = Array.from({ length: Math.round((high - low) / yStep) + 1 }, (_, index) => low + index * yStep);
+  const timestamps = visible.map((item) => Date.parse(`${item.date}T00:00:00Z`));
+  const firstTimestamp = timestamps[0];
+  const lastTimestamp = timestamps[timestamps.length - 1];
+  const hasDateRange = timestamps.every(Number.isFinite) && lastTimestamp > firstTimestamp;
+  const x = (timestamp: number, index: number) => hasDateRange
+    ? padLeft + (timestamp - firstTimestamp) / (lastTimestamp - firstTimestamp) * (width - padLeft - padRight)
+    : padLeft + index * ((width - padLeft - padRight) / Math.max(visible.length - 1, 1));
   const y = (value: number) => padTop + (high - value) / Math.max(high - low, 1) * (height - padTop - padBottom);
-  const path = visible.map((item, index) => `${x(index)},${y(item.marketValue)}`).join(" ");
-  return <div className="valuation-chart"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="持仓市值历史"><polyline points={path} fill="none" stroke="#2e7d55" strokeWidth="3" strokeLinejoin="round" strokeLinecap="round" />{visible.map((item, index) => <g key={item.id}><circle cx={x(index)} cy={y(item.marketValue)} r="3.5" fill="#2e7d55"><title>{item.date} · {formatMoney(item.marketValue, currency)}</title></circle>{(index === 0 || index === visible.length - 1 || index % Math.ceil(visible.length / 6) === 0) && <text x={x(index)} y={height - 9} textAnchor="middle">{item.date.slice(5)}</text>}</g>)}</svg><div className="chart-range"><span>{formatMoney(low, currency)}</span><span>{formatMoney(high, currency)}</span></div></div>;
+  const path = visible.map((item, index) => `${x(timestamps[index], index)},${y(item.marketValue)}`).join(" ");
+  const spanDays = hasDateRange ? Math.round((lastTimestamp - firstTimestamp) / 86_400_000) : 0;
+  const tickCount = hasDateRange ? Math.min(5, spanDays + 1) : 0;
+  const xTicks = Array.from({ length: tickCount }, (_, index) => {
+    const ratio = tickCount === 1 ? 0 : index / (tickCount - 1);
+    const timestamp = firstTimestamp + ratio * (lastTimestamp - firstTimestamp);
+    return { x: padLeft + ratio * (width - padLeft - padRight), label: new Date(timestamp).toISOString().slice(5, 10) };
+  });
+  return (
+    <div className="valuation-chart">
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="持仓市值历史">
+        <g className="chart-grid" aria-hidden="true">
+          {yTicks.map((tick) => <line key={`y-${tick}`} x1={padLeft} x2={width - padRight} y1={y(tick)} y2={y(tick)} />)}
+          {xTicks.map((tick) => <line key={`x-${tick.x}`} x1={tick.x} x2={tick.x} y1={padTop} y2={height - padBottom} />)}
+        </g>
+        {yTicks.map((tick) => <text className="chart-y-label" key={`label-${tick}`} x={padLeft - 7} y={y(tick)} textAnchor="end" dominantBaseline="middle">{formatMoney(tick, currency)}</text>)}
+        <polyline points={path} fill="none" stroke="#2e7d55" strokeWidth="3" strokeLinejoin="round" strokeLinecap="round" />
+        {visible.map((item, index) => <circle key={item.id} cx={x(timestamps[index], index)} cy={y(item.marketValue)} r="3.5" fill="#2e7d55"><title>{item.date} · {formatMoney(item.marketValue, currency)}</title></circle>)}
+        {hasDateRange
+          ? xTicks.map((tick) => <text key={`${tick.x}:${tick.label}`} x={tick.x} y={height - 9} textAnchor="middle">{tick.label}</text>)
+          : visible.map((item, index) => (index === 0 || index === visible.length - 1) && <text key={item.id} x={x(timestamps[index], index)} y={height - 9} textAnchor="middle">{item.date.slice(5)}</text>)}
+      </svg>
+    </div>
+  );
 }
 
 function HoldingDetailModal({ detail, onClose }: { detail: HoldingDetail; onClose: () => void }) {
+  const [sort, setSort] = useState<SortState<ValuationHistorySortKey> | null>(null);
+  const recentHistory = useMemo(() => detail.history.slice().reverse().slice(0, 12), [detail.history]);
+  const sortedHistory = useMemo(() => sortRows(recentHistory, sort, (item, key) => {
+    switch (key) {
+      case "date": return item.date;
+      case "marketValue": return item.marketValue;
+      case "changeRate": return item.changeRate;
+      case "source": return item.source;
+    }
+  }), [recentHistory, sort]);
+  const header = (label: string, key: ValuationHistorySortKey) => <SortControl label={label} active={sort?.key === key} direction={sort?.direction ?? "asc"} onSort={() => setSort((current) => toggleSort(current, key))} />;
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="modal holding-detail-modal" role="dialog" aria-modal="true" aria-labelledby="holding-detail-title" onMouseDown={(event) => event.stopPropagation()}>
-        <div className="modal-header"><div><h2 id="holding-detail-title">{detail.name}</h2><p>{detail.code} · {detail.channel} · {detail.currency}</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
+        <div className="modal-header"><div><h2 id="holding-detail-title">{detail.name}</h2><p>{detail.code} · {detail.channel} · {detail.currency}{detail.riskLevel ? ` · ${detail.riskLevel}` : ""}</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div>
         <section className="holding-detail-metrics"><div><span>当前市值</span><strong>{formatMoney(detail.marketValue, detail.currency)}</strong></div><div><span>持有收益</span><strong className={detail.gain >= 0 ? "gain" : "loss"}>{formatMoney(detail.gain, detail.currency)} · {formatPercent(detail.gainRate)}</strong></div><div><span>近7日估值收益</span><strong className={detail.sevenDayReturn === null ? "" : detail.sevenDayReturn >= 0 ? "gain" : "loss"}>{detail.sevenDayReturn === null ? "—" : formatPercent(detail.sevenDayReturn)}</strong></div><div><span>近30日估值收益</span><strong className={detail.thirtyDayReturn === null ? "" : detail.thirtyDayReturn >= 0 ? "gain" : "loss"}>{detail.thirtyDayReturn === null ? "—" : formatPercent(detail.thirtyDayReturn)}</strong></div></section>
         <div className={`holding-signal signal-card-${detail.signal.toLowerCase()}`}><div><Sparkles /><strong>{detail.signalLabel}</strong></div><p>{detail.signalReason}</p></div>
         <div className="history-section"><div className="panel-header"><h2>市值变化</h2><span>最近更新 {detail.valuationDate} · {detail.daysSinceValuation === 0 ? "今天" : `${detail.daysSinceValuation}天前`}</span></div><ValuationHistoryChart points={detail.history} currency={detail.currency} /></div>
-        <div className="history-table"><div className="batch-list-head"><span>日期</span><span>市值</span><span>估值收益</span><span>来源</span></div>{detail.history.slice().reverse().slice(0, 12).map((item) => <div key={item.id}><span>{item.date}</span><strong>{formatMoney(item.marketValue, detail.currency)}</strong><span className={item.changeRate === null ? "" : item.changeRate >= 0 ? "gain" : "loss"}>{item.changeRate === null ? "—" : `${formatMoney(item.changeAmount ?? 0, detail.currency)} · ${formatPercent(item.changeRate)}`}</span><span>{item.source}</span></div>)}</div>
+        <div className="history-table"><div className="batch-list-head">{header("日期", "date")}{header("市值", "marketValue")}{header("估值收益", "changeRate")}{header("来源", "source")}</div>{sortedHistory.map((item) => <div key={item.id}><span>{item.date}</span><strong>{formatMoney(item.marketValue, detail.currency)}</strong><span className={item.changeRate === null ? "" : item.changeRate >= 0 ? "gain" : "loss"}>{item.changeRate === null ? "—" : `${formatMoney(item.changeAmount ?? 0, detail.currency)} · ${formatPercent(item.changeRate)}`}</span><span>{item.source}</span></div>)}</div>
         <div className="advice-disclaimer"><AlertTriangle />这些信号是记录整理和复核提示，不是收益保证或个性化投资顾问意见。历史表现不能预测未来。</div>
         <div className="entry-actions"><button className="button secondary" onClick={onClose}>关闭</button></div>
       </section>
@@ -1051,36 +1215,49 @@ function AnalyticsView({ analytics, currency, onCurrencyChange }: { analytics: A
   );
 }
 
-function ProductSortHeader({ label, sortKey, activeKey, direction, onSort }: { label: string; sortKey: ProductSortKey; activeKey: ProductSortKey; direction: SortDirection; onSort: (key: ProductSortKey) => void }) {
-  const active = sortKey === activeKey;
-  return <th aria-sort={active ? direction === "asc" ? "ascending" : "descending" : "none"}><button className={`sortable-header ${active ? "active" : ""}`} type="button" onClick={() => onSort(sortKey)}>{label}{active ? direction === "asc" ? <ArrowUp /> : <ArrowDown /> : <span className="sort-placeholder">↕</span>}</button></th>;
-}
-
 function MasterDataView({ data, onEdit }: { data: MasterData; onEdit: (target: EditableRecord) => void }) {
   const [section, setSection] = useState<"products" | "accounts" | "deposits">("products");
-  const [productSort, setProductSort] = useState<{ key: ProductSortKey; direction: SortDirection }>({ key: "code", direction: "asc" });
-  const sortedProducts = useMemo(() => {
-    const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
-    return [...data.products].sort((left, right) => {
-      const leftValue = (left[productSort.key] ?? "").trim();
-      const rightValue = (right[productSort.key] ?? "").trim();
-      if (!leftValue && rightValue) return 1;
-      if (leftValue && !rightValue) return -1;
-      const primary = collator.compare(leftValue, rightValue) * (productSort.direction === "asc" ? 1 : -1);
-      if (primary !== 0) return primary;
-      const byCode = collator.compare(left.code, right.code);
-      return byCode !== 0 ? byCode : left.id - right.id;
-    });
-  }, [data.products, productSort]);
-  const changeProductSort = (key: ProductSortKey) => {
-    setProductSort((current) => current.key === key ? { key, direction: current.direction === "asc" ? "desc" : "asc" } : { key, direction: "asc" });
-  };
+  const [productSort, setProductSort] = useState<SortState<ProductSortKey>>({ key: "code", direction: "asc" });
+  const [accountSort, setAccountSort] = useState<SortState<AccountSortKey> | null>(null);
+  const [depositSort, setDepositSort] = useState<SortState<DepositSortKey> | null>(null);
+  const sortedProducts = useMemo(() => sortRows(data.products, productSort, (item, key) => {
+    switch (key) {
+      case "name": return item.name;
+      case "code": return item.code;
+      case "currency": return item.currency;
+      case "issuer": return item.issuer;
+      case "purchaseBanks": return item.purchaseBanks.join("、");
+      case "riskLevel": return item.riskLevel;
+      case "source": return item.source === "excel" ? "Excel" : "手工";
+    }
+  }), [data.products, productSort]);
+  const sortedAccounts = useMemo(() => sortRows(data.accounts, accountSort, (item, key) => {
+    switch (key) {
+      case "account": return `${item.institution} ${item.name}`;
+      case "currency": return item.currency;
+      case "source": return item.source === "excel" ? "Excel" : "手工";
+    }
+  }), [data.accounts, accountSort]);
+  const sortedDeposits = useMemo(() => sortRows(data.deposits, depositSort, (item, key) => {
+    switch (key) {
+      case "name": return item.name;
+      case "institution": return item.institution;
+      case "currency": return item.currency;
+      case "principal": return item.principal;
+      case "maturityDate": return item.maturityDate;
+      case "annualRate": return item.annualRate;
+      case "status": return item.status === "active" ? "持有中" : item.status === "matured" ? "已到期" : "已取消";
+    }
+  }), [data.deposits, depositSort]);
+  const productHeader = (label: string, key: ProductSortKey) => <SortableHeader label={label} active={productSort.key === key} direction={productSort.direction} onSort={() => setProductSort((current) => toggleSort(current, key))} />;
+  const accountHeader = (label: string, key: AccountSortKey) => <SortableHeader label={label} active={accountSort?.key === key} direction={accountSort?.direction ?? "asc"} onSort={() => setAccountSort((current) => toggleSort(current, key))} />;
+  const depositHeader = (label: string, key: DepositSortKey, className?: string) => <SortableHeader label={label} className={className} active={depositSort?.key === key} direction={depositSort?.direction ?? "asc"} onSort={() => setDepositSort((current) => toggleSort(current, key))} />;
   return (
     <article className="panel table-panel master-panel">
       <div className="panel-header"><div><h2>资料管理</h2><span>修改会自动备份并保留变更审计；手工修正不会被下次导入覆盖</span></div><div className="segmented"><button className={section === "products" ? "active" : ""} onClick={() => setSection("products")}>产品 {data.products.length}</button><button className={section === "accounts" ? "active" : ""} onClick={() => setSection("accounts")}>账户 {data.accounts.length}</button><button className={section === "deposits" ? "active" : ""} onClick={() => setSection("deposits")}>存款 {data.deposits.length}</button></div></div>
-      {section === "products" && <div className="table-scroll"><table className="product-table"><thead><tr><ProductSortHeader label="名称" sortKey="name" activeKey={productSort.key} direction={productSort.direction} onSort={changeProductSort} /><ProductSortHeader label="代码" sortKey="code" activeKey={productSort.key} direction={productSort.direction} onSort={changeProductSort} /><th>币种</th><th>发行机构</th><th>购买银行</th><ProductSortHeader label="风险等级" sortKey="riskLevel" activeKey={productSort.key} direction={productSort.direction} onSort={changeProductSort} /><th>来源</th><th /></tr></thead><tbody>{sortedProducts.map((item) => <tr key={item.id}><td><strong>{item.name}</strong></td><td className="product-code">{item.code}</td><td>{item.currency}</td><td>{item.issuer ?? "—"}</td><td className="purchase-banks">{item.purchaseBanks.length ? item.purchaseBanks.join("、") : "—"}</td><td>{item.riskLevel ?? "—"}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "product", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
-      {section === "accounts" && <div className="table-scroll"><table><thead><tr><th>账户</th><th>币种</th><th>来源</th><th /></tr></thead><tbody>{data.accounts.map((item) => <tr key={item.id}><td><strong>{item.institution}</strong><span>{item.name}</span></td><td>{item.currency}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "account", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
-      {section === "deposits" && <div className="table-scroll"><table className="deposit-table"><thead><tr><th>存款</th><th>账户</th><th>币种</th><th className="number">本金</th><th>到期日</th><th>年利率</th><th>状态</th><th /></tr></thead><tbody>{data.deposits.map((item) => <tr key={item.id}><td><strong>{item.name}</strong><span>{item.source === "excel" ? "Excel 导入" : "手工录入"}</span></td><td>{item.institution}</td><td>{item.currency}</td><td className="number">{formatMoney(item.principal, item.currency)}</td><td>{item.maturityDate}</td><td>{formatPercent(item.annualRate)}</td><td><span className="status">{item.status === "active" ? "持有中" : item.status === "matured" ? "已到期" : "已取消"}</span></td><td><button className="icon-button" onClick={() => onEdit({ entityType: "deposit", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
+      {section === "products" && <div className="table-scroll"><table className="product-table"><thead><tr>{productHeader("名称", "name")}{productHeader("代码", "code")}{productHeader("币种", "currency")}{productHeader("发行机构", "issuer")}{productHeader("购买银行", "purchaseBanks")}{productHeader("风险等级", "riskLevel")}{productHeader("来源", "source")}<th /></tr></thead><tbody>{sortedProducts.map((item) => <tr key={item.id}><td><strong>{item.name}</strong></td><td className="product-code">{item.code}</td><td>{item.currency}</td><td>{item.issuer ?? "—"}</td><td className="purchase-banks">{item.purchaseBanks.length ? item.purchaseBanks.join("、") : "—"}</td><td>{item.riskLevel ?? "—"}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "product", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
+      {section === "accounts" && <div className="table-scroll"><table><thead><tr>{accountHeader("账户", "account")}{accountHeader("币种", "currency")}{accountHeader("来源", "source")}<th /></tr></thead><tbody>{sortedAccounts.map((item) => <tr key={item.id}><td><strong>{item.institution}</strong><span>{item.name}</span></td><td>{item.currency}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "account", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
+      {section === "deposits" && <div className="table-scroll"><table className="deposit-table"><thead><tr>{depositHeader("存款", "name")}{depositHeader("账户", "institution")}{depositHeader("币种", "currency")}{depositHeader("本金", "principal", "number")}{depositHeader("到期日", "maturityDate")}{depositHeader("年利率", "annualRate")}{depositHeader("状态", "status")}<th /></tr></thead><tbody>{sortedDeposits.map((item) => <tr key={item.id}><td><strong>{item.name}</strong><span>{item.source === "excel" ? "Excel 导入" : "手工录入"}</span></td><td>{item.institution}</td><td>{item.currency}</td><td className="number">{formatMoney(item.principal, item.currency)}</td><td>{item.maturityDate}</td><td>{formatPercent(item.annualRate)}</td><td><span className="status">{item.status === "active" ? "持有中" : item.status === "matured" ? "已到期" : "已取消"}</span></td><td><button className="icon-button" onClick={() => onEdit({ entityType: "deposit", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
     </article>
   );
 }
@@ -1089,6 +1266,7 @@ function ReconciliationView({ data, onReconcile, onOpenIssue }: { data: Reconcil
   const [section, setSection] = useState<"banks" | "quality">("banks");
   const [severity, setSeverity] = useState("all");
   const [searchText, setSearchText] = useState("");
+  const [sort, setSort] = useState<SortState<ReconciliationSortKey> | null>(null);
   const matched = data.institutions.filter((item) => item.status === "matched").length;
   const differences = data.institutions.filter((item) => item.status === "difference").length;
   const missing = data.institutions.filter((item) => item.status === "missing" && item.trackedTotalCny > 0.000001).length;
@@ -1096,12 +1274,26 @@ function ReconciliationView({ data, onReconcile, onOpenIssue }: { data: Reconcil
     const keyword = searchText.trim().toLowerCase();
     return (severity === "all" || issue.severity === severity) && (!keyword || `${issue.category} ${issue.title} ${issue.detail}`.toLowerCase().includes(keyword));
   });
+  const sortedInstitutions = useMemo(() => sortRows(data.institutions, sort, (item, key) => {
+    switch (key) {
+      case "institution": return item.institution;
+      case "usdCnyRate": return item.hasUsdAssets ? item.usdCnyRate : null;
+      case "trackedWealthCny": return item.trackedWealthCny;
+      case "actualWealthCny": return item.actualWealthCny;
+      case "trackedDepositCny": return item.trackedDepositCny;
+      case "actualDepositCny": return item.actualDepositCny;
+      case "demandCny": return item.balanceDate ? item.demandCny : null;
+      case "actualTotalCny": return item.actualTotalCny;
+      case "status": return item.status === "matched" ? "已一致" : item.status === "difference" ? "有差额" : "未核对";
+    }
+  }), [data.institutions, sort]);
+  const header = (label: string, key: ReconciliationSortKey, className?: string) => <SortableHeader label={label} className={className} active={sort?.key === key} direction={sort?.direction ?? "asc"} onSort={() => setSort((current) => toggleSort(current, key))} />;
   return (
     <>
       <section className="metrics-grid reconciliation-metrics"><Metric label="已核对银行" value={`${matched}`} detail={`共 ${data.institutions.length} 家银行`} positive={matched > 0} /><Metric label="存在差额" value={`${differences}`} detail="理财或存款分项与软件不一致" positive={differences === 0} /><Metric label="尚未核对" value={`${missing}`} detail="有资产但没有银行分项快照" positive={missing === 0} /><Metric label="数据质量问题" value={`${data.issueCount}`} detail={`${data.highPriorityCount} 项高优先级`} positive={data.highPriorityCount === 0} /></section>
       <article className="panel reconciliation-panel">
         <div className="panel-header"><div><h2>对账与数据质量</h2><span>同一家银行的人民币与美元资产合并；银行 App 三个分项均按人民币录入</span></div><div className="segmented"><button className={section === "banks" ? "active" : ""} onClick={() => setSection("banks")}>银行对账</button><button className={section === "quality" ? "active" : ""} onClick={() => setSection("quality")}>问题清单 {data.issueCount}</button></div></div>
-        {section === "banks" && <div className="table-scroll"><table className="reconciliation-table"><thead><tr><th>银行</th><th className="number">USD/CNY</th><th className="number">软件理财</th><th className="number">银行理财 / 差额</th><th className="number">软件存款</th><th className="number">银行存款 / 差额</th><th className="number">银行活期</th><th className="number">银行总资产</th><th>状态</th><th /></tr></thead><tbody>{data.institutions.map((item) => <tr key={item.institution}><td><strong>{item.institution}</strong><span>{item.balanceDate ? `核对于 ${item.balanceDate}` : "尚无对账快照"}</span></td><td className="number">{item.hasUsdAssets ? item.usdCnyRate.toFixed(4) : "—"}</td><td className="number"><strong>{formatMoney(item.trackedWealthCny, "CNY")}</strong><span>{item.usdWealthValue > 0 ? `含 ${formatMoney(item.usdWealthValue, "USD")}` : "仅人民币"}</span></td><td className="number">{item.actualWealthCny === null ? "—" : formatMoney(item.actualWealthCny, "CNY")}<span className={item.wealthDifference === null ? "" : Math.abs(item.wealthDifference) <= 1 ? "gain" : "loss"}>{item.wealthDifference === null ? "" : `差 ${formatMoney(item.wealthDifference, "CNY")}`}</span></td><td className="number"><strong>{formatMoney(item.trackedDepositCny, "CNY")}</strong><span>{item.usdDepositValue > 0 ? `含 ${formatMoney(item.usdDepositValue, "USD")}` : "仅人民币"}</span></td><td className="number">{item.actualDepositCny === null ? "—" : formatMoney(item.actualDepositCny, "CNY")}<span className={item.depositDifference === null ? "" : Math.abs(item.depositDifference) <= 1 ? "gain" : "loss"}>{item.depositDifference === null ? "" : `差 ${formatMoney(item.depositDifference, "CNY")}`}</span></td><td className="number">{item.balanceDate ? formatMoney(item.demandCny, "CNY") : "—"}</td><td className="number"><strong>{item.actualTotalCny === null ? "—" : formatMoney(item.actualTotalCny, "CNY")}</strong><span>{item.difference === null ? "" : `总差 ${formatMoney(item.difference, "CNY")}`}</span></td><td><span className={`reconciliation-status status-${item.status}`}>{item.status === "matched" ? "已一致" : item.status === "difference" ? "有差额" : "未核对"}</span></td><td><button className="button secondary compact" onClick={() => onReconcile(item)}>录入分项</button></td></tr>)}</tbody></table></div>}
+        {section === "banks" && <div className="table-scroll"><table className="reconciliation-table"><thead><tr>{header("银行", "institution")}{header("USD/CNY", "usdCnyRate", "number")}{header("软件理财", "trackedWealthCny", "number")}{header("银行理财 / 差额", "actualWealthCny", "number")}{header("软件存款", "trackedDepositCny", "number")}{header("银行存款 / 差额", "actualDepositCny", "number")}{header("银行活期", "demandCny", "number")}{header("银行总资产", "actualTotalCny", "number")}{header("状态", "status")}<th /></tr></thead><tbody>{sortedInstitutions.map((item) => <tr key={item.institution}><td><strong>{item.institution}</strong><span>{item.balanceDate ? `核对于 ${item.balanceDate}` : "尚无对账快照"}</span></td><td className="number">{item.hasUsdAssets ? item.usdCnyRate.toFixed(4) : "—"}</td><td className="number"><strong>{formatMoney(item.trackedWealthCny, "CNY")}</strong><span>{item.usdWealthValue > 0 ? `含 ${formatMoney(item.usdWealthValue, "USD")}` : "仅人民币"}</span></td><td className="number">{item.actualWealthCny === null ? "—" : formatMoney(item.actualWealthCny, "CNY")}<span className={item.wealthDifference === null ? "" : Math.abs(item.wealthDifference) <= 1 ? "gain" : "loss"}>{item.wealthDifference === null ? "" : `差 ${formatMoney(item.wealthDifference, "CNY")}`}</span></td><td className="number"><strong>{formatMoney(item.trackedDepositCny, "CNY")}</strong><span>{item.usdDepositValue > 0 ? `含 ${formatMoney(item.usdDepositValue, "USD")}` : "仅人民币"}</span></td><td className="number">{item.actualDepositCny === null ? "—" : formatMoney(item.actualDepositCny, "CNY")}<span className={item.depositDifference === null ? "" : Math.abs(item.depositDifference) <= 1 ? "gain" : "loss"}>{item.depositDifference === null ? "" : `差 ${formatMoney(item.depositDifference, "CNY")}`}</span></td><td className="number">{item.balanceDate ? formatMoney(item.demandCny, "CNY") : "—"}</td><td className="number"><strong>{item.actualTotalCny === null ? "—" : formatMoney(item.actualTotalCny, "CNY")}</strong><span>{item.difference === null ? "" : `总差 ${formatMoney(item.difference, "CNY")}`}</span></td><td><span className={`reconciliation-status status-${item.status}`}>{item.status === "matched" ? "已一致" : item.status === "difference" ? "有差额" : "未核对"}</span></td><td><button className="button secondary compact" onClick={() => onReconcile(item)}>录入分项</button></td></tr>)}</tbody></table></div>}
         {section === "quality" && <><div className="quality-toolbar"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索问题" /></label><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">全部优先级</option><option value="high">高优先级</option><option value="medium">中优先级</option><option value="low">低优先级</option></select><span>显示 {filteredIssues.length}/{data.issues.length} 项</span></div><div className="quality-list">{filteredIssues.map((issue) => <article key={issue.key} className={`quality-item severity-${issue.severity}`}><div className="quality-severity">{issue.severity === "high" ? "高" : issue.severity === "medium" ? "中" : "低"}</div><div><span>{issue.category}</span><strong>{issue.title}</strong><p>{issue.detail}</p></div><button className="button secondary compact" onClick={() => onOpenIssue(issue)}>前往处理</button></article>)}{!filteredIssues.length && <div className="quality-empty"><CheckCircle2 />当前筛选下没有待处理问题</div>}</div></>}
       </article>
     </>
@@ -1184,6 +1376,7 @@ function TransactionsView({ transactions, onSelect, loading }: {
   const [statusFilter, setStatusFilter] = useState("all");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  const [sort, setSort] = useState<SortState<TransactionSortKey> | null>(null);
   const institutions = useMemo(() => [...new Set(transactions.map((item) => item.institution).filter((item): item is string => Boolean(item)))].sort(), [transactions]);
   const filtered = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
@@ -1197,6 +1390,21 @@ function TransactionsView({ transactions, onSelect, loading }: {
       return matchesKeyword && matchesOperation && matchesCurrency && matchesInstitution && matchesDate && matchesStatus;
     });
   }, [transactions, searchText, operationFilter, currencyFilter, institutionFilter, statusFilter, dateFrom, dateTo]);
+  const sorted = useMemo(() => sortRows(filtered, sort, (item, key) => {
+    switch (key) {
+      case "tradeDate": return item.tradeDate;
+      case "operation": return operationLabels[item.operation] ?? item.operation;
+      case "productName": return item.title;
+      case "productCode": return item.code;
+      case "currency": return item.currency;
+      case "amount": return item.amount;
+      case "costBasis": return item.costBasis;
+      case "realizedGain": return item.realizedGain;
+      case "note": return item.note;
+    }
+  }), [filtered, sort]);
+  const productSortActive = sort?.key === "productName" || sort?.key === "productCode";
+  const changeSort = (key: TransactionSortKey) => setSort((current) => toggleSort(current, key));
   const gains = filtered.reduce<Record<CurrencyCode, number>>((totals, item) => {
     if (item.reversedBy === null && item.operation !== "REVERSAL") totals[item.currency] += item.realizedGain;
     return totals;
@@ -1205,8 +1413,8 @@ function TransactionsView({ transactions, onSelect, loading }: {
     <article className="panel table-panel">
       <div className="panel-header"><div><h2>交易流水</h2><span>显示 {filtered.length}/{transactions.length} 笔 · 筛选结果已实现收益 {formatMoney(gains.CNY, "CNY")} / {formatMoney(gains.USD, "USD")}</span></div><button className="button secondary compact" type="button" onClick={() => { setSearchText(""); setOperationFilter("all"); setCurrencyFilter("all"); setInstitutionFilter("all"); setStatusFilter("all"); setDateFrom(""); setDateTo(""); }}><ListFilter />清除筛选</button></div>
       <div className="filter-bar transaction-filters"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索产品、代码、银行或备注" /></label><select value={operationFilter} onChange={(event) => setOperationFilter(event.target.value)}><option value="all">全部操作</option>{Object.entries(operationLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><select value={currencyFilter} onChange={(event) => setCurrencyFilter(event.target.value)}><option value="all">全部币种</option><option value="CNY">人民币</option><option value="USD">美元</option></select><select value={institutionFilter} onChange={(event) => setInstitutionFilter(event.target.value)}><option value="all">全部银行</option>{institutions.map((institution) => <option key={institution} value={institution}>{institution}</option>)}</select><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">全部状态</option><option value="effective">有效流水</option><option value="reversed">冲销记录</option><option value="review">待核对</option></select><div className="transaction-date-range"><label className="date-filter">从<DateInput ariaLabel="开始日期" value={dateFrom} onChange={setDateFrom} /></label><label className="date-filter">至<DateInput ariaLabel="结束日期" value={dateTo} onChange={setDateTo} /></label></div></div>
-      <div className="table-scroll"><table className="transaction-table"><colgroup><col className="transaction-date-col" /><col className="transaction-operation-col" /><col /><col className="transaction-currency-col" /><col className="transaction-money-col" /><col className="transaction-money-col" /><col className="transaction-money-col" /><col className="transaction-note-col" /></colgroup><thead><tr><th>日期</th><th>操作</th><th>产品</th><th>币种</th><th className="number">现金金额</th><th className="number">核销成本</th><th className="number">已实现收益</th><th>备注</th></tr></thead><tbody>
-        {filtered.map((item) => {
+      <div className="table-scroll"><table className="transaction-table"><colgroup><col className="transaction-date-col" /><col className="transaction-operation-col" /><col /><col className="transaction-currency-col" /><col className="transaction-money-col" /><col className="transaction-money-col" /><col className="transaction-money-col" /><col className="transaction-note-col" /></colgroup><thead><tr><SortableHeader label="日期" active={sort?.key === "tradeDate"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("tradeDate")} /><SortableHeader label="操作" active={sort?.key === "operation"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("operation")} /><SortableHeader label="产品" active={productSortActive} direction={sort?.direction ?? "asc"} activeDetail={sort?.key === "productCode" ? "代码" : "名称"} onSort={() => setSort((current) => cycleProductSort(current, "productName", "productCode"))} /><SortableHeader label="币种" active={sort?.key === "currency"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("currency")} /><SortableHeader label="现金金额" className="number" active={sort?.key === "amount"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("amount")} /><SortableHeader label="核销成本" className="number" active={sort?.key === "costBasis"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("costBasis")} /><SortableHeader label="已实现收益" className="number" active={sort?.key === "realizedGain"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("realizedGain")} /><SortableHeader label="备注" active={sort?.key === "note"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("note")} /></tr></thead><tbody>
+        {sorted.map((item) => {
           const incoming = ["SELL", "REDEEM", "PRODUCT_MATURITY", "DEPOSIT_MATURITY", "DIVIDEND"].includes(item.operation);
           const cashless = item.operation === "VALUATION";
           const neutral = ["REVERSAL", "TRANSFER"].includes(item.operation);

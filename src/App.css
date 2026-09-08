@@ -292,6 +292,7 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
 .sortable-header { margin: -5px -6px; padding: 5px 6px; border: 0; border-radius: 6px; background: transparent; color: inherit; display: inline-flex; align-items: center; gap: 4px; font: inherit; cursor: pointer; }
 .sortable-header:hover { background: #edf3ef; color: #365e48; }
 .sortable-header.active { color: #266b48; font-weight: 600; }
+.sortable-header small { padding: 1px 4px; border-radius: 4px; background: #e2eee6; color: #397357; font-size: 8px; font-weight: 600; }
 .sortable-header svg { width: 12px; height: 12px; }
 .sort-placeholder { width: 12px; color: #9aa59e; text-align: center; font-size: 10px; }
 .icon-button { width: 31px; height: 31px; padding: 0; border: 1px solid #d8e1da; border-radius: 8px; background: #fff; color: #3c6951; display: grid; place-items: center; }
@@ -320,6 +321,8 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
 .batch-list-head, .batch-row { display: grid; grid-template-columns: minmax(250px, 1fr) 135px 150px 135px; gap: 12px; align-items: center; }
 .batch-list-head { padding: 8px 11px; background: #f2f5f3; color: #748179; font-size: 10px; }
 .batch-list-head span:not(:first-child) { text-align: right; }
+.batch-list-head > .sortable-header { margin: -4px -6px; }
+.batch-list-head > .sortable-header:not(:first-child) { justify-self: end; }
 .batch-row { padding: 8px 11px; border-top: 1px solid #edf1ee; font-size: 11px; }
 .batch-row:first-of-type { border-top: 0; }
 .batch-row > div { min-width: 0; display: grid; }
@@ -358,6 +361,8 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
 .valuation-chart { position: relative; }
 .valuation-chart svg { display: block; width: 100%; height: auto; }
 .valuation-chart text { fill: #7a877f; font-size: 9px; }
+.valuation-chart .chart-grid line { stroke: #dfe6e0; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.valuation-chart .chart-y-label { font-size: 8px; font-variant-numeric: tabular-nums; }
 .history-empty { min-height: 150px; display: grid; place-items: center; color: #849088; font-size: 11px; }
 .history-table { margin-top: 13px; border: 1px solid #e1e7e2; border-radius: 10px; overflow: hidden; }
 .history-table .batch-list-head, .history-table > div { grid-template-columns: 100px 160px minmax(170px, 1fr) 90px; }

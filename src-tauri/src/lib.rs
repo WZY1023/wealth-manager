@@ -120,6 +120,7 @@ struct HoldingDetail {
     signal: String,
     signal_label: String,
     signal_reason: String,
+    risk_level: Option<String>,
     history: Vec<ValuationHistoryPoint>,
 }
 
@@ -1152,6 +1153,142 @@ fn replace_current_valuation(
     Ok(())
 }
 
+fn deduplicate_manual_valuations_for_day(
+    tx: &Transaction<'_>,
+    product: i64,
+    account: i64,
+    date: &str,
+    keep_transaction_id: i64,
+) -> Result<usize, String> {
+    let records = {
+        let mut statement = tx
+            .prepare(
+                "SELECT v.id, t.id, t.valuation_before
+                 FROM valuations v
+                 JOIN transactions t ON t.id = v.transaction_id
+                 WHERE v.product_id = ?1 AND v.account_id = ?2 AND v.valuation_date = ?3
+                   AND v.source = 'manual' AND t.source = 'manual'
+                   AND t.transaction_type = 'VALUATION' AND t.reversed_by IS NULL
+                 ORDER BY v.id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![product, account, date], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    if records.len() < 2 || !records.iter().any(|record| record.1 == keep_transaction_id) {
+        return Ok(0);
+    }
+
+    // The surviving update represents the whole day's movement, so its baseline
+    // must remain the value from before the first manual update that day.
+    tx.execute(
+        "UPDATE transactions SET valuation_before = ?1 WHERE id = ?2",
+        params![records[0].2, keep_transaction_id],
+    )
+    .map_err(|error| error.to_string())?;
+
+    let mut removed = 0;
+    for (valuation_id, transaction_id, _) in records {
+        if transaction_id == keep_transaction_id {
+            continue;
+        }
+        tx.execute("DELETE FROM valuations WHERE id = ?1", [valuation_id])
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM transactions
+             WHERE id = ?1 AND transaction_type = 'VALUATION'
+               AND source = 'manual' AND reversed_by IS NULL",
+            [transaction_id],
+        )
+        .map_err(|error| error.to_string())?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn duplicate_manual_valuation_count(conn: &Connection) -> Result<usize, String> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(update_count - 1), 0)
+         FROM (
+           SELECT COUNT(*) AS update_count
+           FROM valuations v
+           JOIN transactions t ON t.id = v.transaction_id
+           WHERE v.source = 'manual' AND t.source = 'manual'
+             AND t.transaction_type = 'VALUATION' AND t.reversed_by IS NULL
+           GROUP BY v.product_id, v.account_id, v.valuation_date
+           HAVING COUNT(*) >= 2
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as usize)
+    .map_err(|error| error.to_string())
+}
+
+fn deduplicate_existing_manual_valuations(conn: &mut Connection) -> Result<usize, String> {
+    let groups = {
+        let mut statement = conn
+            .prepare(
+                "SELECT v.product_id, v.account_id, v.valuation_date
+                 FROM valuations v
+                 JOIN transactions t ON t.id = v.transaction_id
+                 WHERE v.source = 'manual' AND t.source = 'manual'
+                   AND t.transaction_type = 'VALUATION' AND t.reversed_by IS NULL
+                 GROUP BY v.product_id, v.account_id, v.valuation_date
+                 HAVING COUNT(*) >= 2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let mut removed = 0;
+    for (product, account, date) in groups {
+        let keep_transaction_id = tx
+            .query_row(
+                "SELECT t.id
+                 FROM valuations v
+                 JOIN transactions t ON t.id = v.transaction_id
+                 WHERE v.product_id = ?1 AND v.account_id = ?2 AND v.valuation_date = ?3
+                   AND v.source = 'manual' AND t.source = 'manual'
+                   AND t.transaction_type = 'VALUATION' AND t.reversed_by IS NULL
+                 ORDER BY v.id DESC LIMIT 1",
+                params![product, account, date],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        removed += deduplicate_manual_valuations_for_day(
+            &tx,
+            product,
+            account,
+            &date,
+            keep_transaction_id,
+        )?;
+    }
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(removed)
+}
+
 fn compounded_valuation_return(
     conn: &Connection,
     product: i64,
@@ -1392,6 +1529,13 @@ fn apply_batch_valuations(
             Some(transaction_id),
         )
         .map_err(|error| error.to_string())?;
+        deduplicate_manual_valuations_for_day(
+            &tx,
+            item.product_id,
+            item.account_id,
+            &valuation_date,
+            transaction_id,
+        )?;
     }
     tx.commit().map_err(|error| error.to_string())?;
     Ok(BatchValuationResult {
@@ -1719,8 +1863,19 @@ fn apply_entry(conn: &mut Connection, input: &EntryInput) -> Result<EntryResult,
                 Some(transaction_id),
             )
             .map_err(|error| error.to_string())?;
+            let removed = deduplicate_manual_valuations_for_day(
+                &tx,
+                product,
+                account,
+                &trade_date,
+                transaction_id,
+            )?;
             EntryResult {
-                message: "当前市值已更新，旧市值已作为历史快照保留".to_string(),
+                message: if removed > 0 {
+                    format!("当前市值已更新，已替换当天 {removed} 条较早的手工估值")
+                } else {
+                    "当前市值已更新，其他日期的历史快照已保留".to_string()
+                },
                 realized_gain: None,
             }
         }
@@ -5513,7 +5668,7 @@ fn get_holding_detail(
         .db
         .lock()
         .map_err(|_| "数据库正在使用中".to_string())?;
-    let (name, code, channel, currency, cost, market_value, valuation_date): (
+    let (name, code, channel, currency, cost, market_value, valuation_date, risk_level): (
         String,
         String,
         String,
@@ -5521,6 +5676,7 @@ fn get_holding_detail(
         f64,
         f64,
         String,
+        Option<String>,
     ) = conn
         .query_row(
             "SELECT p.name, p.code, a.institution, v.currency,
@@ -5529,7 +5685,7 @@ fn get_holding_detail(
                       FROM position_lots l
                       WHERE l.product_id = p.id AND l.account_id = a.id AND l.status = 'active'
                     ), 0),
-                    v.market_value, v.valuation_date
+                    v.market_value, v.valuation_date, p.risk_level
              FROM valuations v
              JOIN products p ON p.id = v.product_id
              JOIN accounts a ON a.id = v.account_id
@@ -5544,6 +5700,7 @@ fn get_holding_detail(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -5617,6 +5774,7 @@ fn get_holding_detail(
         signal: insight.signal,
         signal_label: insight.signal_label,
         signal_reason: insight.signal_reason,
+        risk_level,
         history,
     })
 }
@@ -5662,6 +5820,9 @@ fn record_entry(input: EntryInput, state: State<'_, AppState>) -> Result<EntryRe
         .db
         .lock()
         .map_err(|_| "数据库正在使用中".to_string())?;
+    if input.operation.trim().eq_ignore_ascii_case("VALUATION") {
+        create_auto_backup(&conn, &state.backup_dir, "pre-valuation")?;
+    }
     apply_entry(&mut conn, &input)
 }
 
@@ -6058,6 +6219,23 @@ pub fn run() {
             migrate(&conn)?;
             if let Err(error) = ensure_daily_backup(&conn, &backup_dir) {
                 eprintln!("daily backup failed: {error}");
+            }
+            match duplicate_manual_valuation_count(&conn) {
+                Ok(count) if count > 0 => {
+                    match create_auto_backup(&conn, &backup_dir, "pre-valuation-deduplication") {
+                        Ok(_) => match deduplicate_existing_manual_valuations(&mut conn) {
+                            Ok(removed) => eprintln!(
+                                "removed {removed} older same-day manual valuation records"
+                            ),
+                            Err(error) => eprintln!("valuation deduplication failed: {error}"),
+                        },
+                        Err(error) => eprintln!(
+                            "valuation deduplication skipped because backup failed: {error}"
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("valuation duplicate check failed: {error}"),
             }
             if let Ok(import_path) = std::env::var("WEALTH_MANAGER_IMPORT_PATH") {
                 let imported: i64 =
@@ -7085,7 +7263,17 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("valuation count");
-        assert_eq!(valuation_transactions, 4);
+        assert_eq!(valuation_transactions, 2);
+        let valuation_snapshots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM valuations v
+                 JOIN transactions t ON t.id = v.transaction_id
+                 WHERE t.transaction_type = 'VALUATION'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("valuation snapshot count");
+        assert_eq!(valuation_snapshots, 2);
         let current_valuations: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM valuations WHERE is_current = 1",
