@@ -16,6 +16,7 @@ import {
   Download,
   FileSpreadsheet,
   HardDriveDownload,
+  Landmark,
   LayoutDashboard,
   ListFilter,
   Pencil,
@@ -33,7 +34,7 @@ import {
 } from "lucide-react";
 import "./App.css";
 
-type View = "overview" | "holdings" | "history" | "transactions" | "calendar" | "analytics" | "masterData" | "reconciliation";
+type View = "overview" | "holdings" | "deposits" | "history" | "transactions" | "calendar" | "analytics" | "masterData" | "reconciliation";
 type CurrencyCode = "CNY" | "USD";
 type EntryOperation = "BUY" | "SELL" | "PRODUCT_MATURITY" | "VALUATION" | "DIVIDEND" | "FEE" | "TRANSFER" | "DEPOSIT_OPEN" | "DEPOSIT_MATURITY";
 type SortDirection = "asc" | "desc";
@@ -180,7 +181,7 @@ type InstitutionSnapshotInput = { institution: string; balanceDate: string; usdC
 
 type AccountRecord = { id: number; institution: string; name: string; currency: CurrencyCode; source: string };
 type ProductRecord = { id: number; code: string; name: string; currency: CurrencyCode; issuer: string | null; purchaseBanks: string[]; riskLevel: string | null; source: string };
-type DepositRecord = { id: number; accountId: number; institution: string; name: string; currency: CurrencyCode; principal: number; startDate: string | null; maturityDate: string; annualRate: number; status: string; source: string };
+type DepositRecord = { id: number; accountId: number; institution: string; name: string; currency: CurrencyCode; principal: number; startDate: string | null; maturityDate: string; annualRate: number; status: string; maturedAt: string | null; proceeds: number | null; source: string };
 type MasterData = { accounts: AccountRecord[]; products: ProductRecord[]; deposits: DepositRecord[] };
 type EditableRecord = { entityType: "account"; record: AccountRecord } | { entityType: "product"; record: ProductRecord } | { entityType: "deposit"; record: DepositRecord };
 type MasterDataUpdate = {
@@ -243,6 +244,7 @@ const EMPTY_RECONCILIATION: ReconciliationCenter = { institutions: [], issues: [
 const viewTitles: Record<View, string> = {
   overview: "资产总览",
   holdings: "当前持仓",
+  deposits: "定期存款",
   history: "历史理财",
   transactions: "交易流水",
   calendar: "到期日历",
@@ -400,6 +402,7 @@ function App() {
     setLoading(true);
     setError(null);
     try {
+      await invoke<number>("sync_deposit_statuses");
       const [nextDashboard, nextHoldings, nextClosedPositions, nextMaturities, nextTransactions, nextMasterData, nextAnalytics, nextReconciliation] = await Promise.all([
         invoke<Dashboard>("get_dashboard"),
         invoke<Holding[]>("list_holdings"),
@@ -569,7 +572,19 @@ function App() {
       return groups;
     }, {});
   }, [maturities]);
-  const hasData = dashboard.currencies.some((item) => item.totalValue > 0) || transactions.length > 0;
+  const depositMaturityOptions = useMemo<MaturityEvent[]>(() => masterData.deposits
+    .filter((item) => item.status === "active" || (item.status === "matured" && item.maturedAt === null))
+    .map((item) => ({
+      id: item.id,
+      name: item.name,
+      institution: item.institution,
+      currency: item.currency,
+      amount: item.principal,
+      maturityDate: item.maturityDate,
+      daysRemaining: 0,
+      annualRate: item.annualRate,
+    })), [masterData.deposits]);
+  const hasData = dashboard.currencies.some((item) => item.totalValue > 0) || transactions.length > 0 || masterData.deposits.length > 0;
 
   const saveEntry = async (input: EntryInput) => {
     setError(null);
@@ -693,6 +708,7 @@ function App() {
         <nav aria-label="主导航">
           <NavButton active={view === "overview"} onClick={() => setView("overview")} icon={<LayoutDashboard />} label="总览" />
           <NavButton active={view === "holdings"} onClick={() => setView("holdings")} icon={<WalletCards />} label="持仓" />
+          <NavButton active={view === "deposits"} onClick={() => setView("deposits")} icon={<Landmark />} label="定期存款" />
           <NavButton active={view === "history"} onClick={() => setView("history")} icon={<Archive />} label="历史" />
           <NavButton active={view === "transactions"} onClick={() => setView("transactions")} icon={<ClipboardList />} label="交易流水" />
           <NavButton active={view === "calendar"} onClick={() => setView("calendar")} icon={<CalendarDays />} label="到期日历" />
@@ -736,6 +752,7 @@ function App() {
               />
             )}
             {view === "holdings" && <HoldingsView holdings={holdings} onBatchUpdate={() => setBatchValuationOpen(true)} onSelect={(holding) => void openHoldingDetail(holding)} loading={holdingDetailLoading} />}
+            {view === "deposits" && <DepositsView deposits={masterData.deposits} asOfDate={dashboard.asOfDate} onEdit={(record) => setEditingRecord({ entityType: "deposit", record })} />}
             {view === "history" && <HistoryView positions={closedPositions} onSelect={setClosedPositionDetail} />}
             {view === "transactions" && <TransactionsView transactions={transactions} onSelect={(id) => void openTransaction(id)} loading={detailLoading} />}
             {view === "calendar" && <CalendarView groups={groupedMaturities} />}
@@ -766,7 +783,7 @@ function App() {
       {entryOpen && (
         <EntryModal
           holdings={holdings}
-          deposits={maturities}
+          deposits={depositMaturityOptions}
           accounts={masterData.accounts}
           onClose={() => setEntryOpen(false)}
           onSave={saveEntry}
@@ -1215,6 +1232,76 @@ function AnalyticsView({ analytics, currency, onCurrencyChange }: { analytics: A
   );
 }
 
+function depositStatusLabel(status: string) {
+  return status === "active" ? "持有中" : status === "matured" ? "已取出" : "已取消";
+}
+
+function daysBetween(date: string, asOfDate: string) {
+  const target = new Date(`${date}T00:00:00`);
+  const today = new Date(`${asOfDate}T00:00:00`);
+  return Math.round((target.getTime() - today.getTime()) / 86_400_000);
+}
+
+function DepositsView({ deposits, asOfDate, onEdit }: { deposits: DepositRecord[]; asOfDate: string; onEdit: (record: DepositRecord) => void }) {
+  const [searchText, setSearchText] = useState("");
+  const [status, setStatus] = useState("all");
+  const [currency, setCurrency] = useState("all");
+  const [sort, setSort] = useState<SortState<DepositSortKey>>({ key: "maturityDate", direction: "asc" });
+  const active = deposits.filter((item) => item.status === "active");
+  const cnyPrincipal = active.filter((item) => item.currency === "CNY").reduce((sum, item) => sum + item.principal, 0);
+  const usdPrincipal = active.filter((item) => item.currency === "USD").reduce((sum, item) => sum + item.principal, 0);
+  const withdrawnCount = deposits.filter((item) => item.status === "matured").length;
+  const dueSoon = active.filter((item) => {
+    const days = daysBetween(item.maturityDate, asOfDate);
+    return days >= 0 && days <= 30;
+  }).length;
+  const filtered = deposits.filter((item) => {
+    const keyword = searchText.trim().toLowerCase();
+    return (status === "all" || item.status === status)
+      && (currency === "all" || item.currency === currency)
+      && (!keyword || `${item.name} ${item.institution}`.toLowerCase().includes(keyword));
+  });
+  const sorted = useMemo(() => sortRows(filtered, sort, (item, key) => {
+    switch (key) {
+      case "name": return item.name;
+      case "institution": return item.institution;
+      case "currency": return item.currency;
+      case "principal": return item.principal;
+      case "maturityDate": return item.maturityDate;
+      case "annualRate": return item.annualRate;
+      case "status": return depositStatusLabel(item.status);
+    }
+  }), [filtered, sort]);
+  const header = (label: string, key: DepositSortKey, className?: string) => <SortableHeader label={label} className={className} active={sort.key === key} direction={sort.direction} onSort={() => setSort((current) => toggleSort(current, key))} />;
+  return (
+    <>
+      <section className="metrics-grid deposit-metrics">
+        <Metric label="持有中" value={`${active.length} 笔`} detail={`${dueSoon} 笔将在 30 天内到期`} />
+        <Metric label="人民币本金" value={formatMoney(cnyPrincipal, "CNY")} detail="仅统计持有中存款" />
+        <Metric label="美元本金" value={formatMoney(usdPrincipal, "USD")} detail="仅统计持有中存款" />
+        <Metric label="已取出" value={`${withdrawnCount} 笔`} detail="到期日已到后自动转入" />
+      </section>
+      <article className="panel table-panel deposit-panel">
+        <div className="panel-header"><div><h2>存款项目</h2><span>共 {deposits.length} 笔 · 到期日已到的项目自动标记为已取出</span></div></div>
+        <div className="filter-bar deposit-filter">
+          <label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索存款名称或银行" /></label>
+          <select aria-label="存款状态" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">全部状态</option><option value="active">持有中</option><option value="matured">已取出</option><option value="cancelled">已取消</option></select>
+          <select aria-label="存款币种" value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="all">全部币种</option><option value="CNY">人民币 CNY</option><option value="USD">美元 USD</option></select>
+          <span>显示 {sorted.length}/{deposits.length} 笔</span>
+        </div>
+        <div className="table-scroll"><table className="deposit-overview-table"><thead><tr>{header("存款项目", "name")}{header("存款银行", "institution")}{header("币种", "currency")}{header("本金", "principal", "number")}<th>起息日</th>{header("到期日", "maturityDate")}{header("年利率", "annualRate")}{header("状态", "status")}<th /></tr></thead><tbody>
+          {sorted.map((item) => {
+            const days = daysBetween(item.maturityDate, asOfDate);
+            const timing = item.status === "active" ? (days === 0 ? "今天到期" : `${days} 天后`) : item.maturedAt ? `取出于 ${item.maturedAt}` : "到期自动取出";
+            return <tr key={item.id}><td><strong>{item.name}</strong><span>{item.source === "excel" ? "Excel 导入" : "手工录入"}</span></td><td>{item.institution}</td><td>{item.currency}</td><td className="number">{formatMoney(item.principal, item.currency)}{item.proceeds !== null && <span>到账 {formatMoney(item.proceeds, item.currency)}</span>}</td><td className="nowrap">{item.startDate ?? "—"}</td><td className="deposit-maturity-cell"><strong>{item.maturityDate}</strong><span>{timing}</span></td><td>{formatPercent(item.annualRate)}</td><td><span className={`status deposit-status-${item.status}`}>{depositStatusLabel(item.status)}</span></td><td><button className="icon-button" onClick={() => onEdit(item)} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>;
+          })}
+          {!sorted.length && <tr><td className="table-empty" colSpan={9}>没有符合条件的存款项目</td></tr>}
+        </tbody></table></div>
+      </article>
+    </>
+  );
+}
+
 function MasterDataView({ data, onEdit }: { data: MasterData; onEdit: (target: EditableRecord) => void }) {
   const [section, setSection] = useState<"products" | "accounts" | "deposits">("products");
   const [productSort, setProductSort] = useState<SortState<ProductSortKey>>({ key: "code", direction: "asc" });
@@ -1246,7 +1333,7 @@ function MasterDataView({ data, onEdit }: { data: MasterData; onEdit: (target: E
       case "principal": return item.principal;
       case "maturityDate": return item.maturityDate;
       case "annualRate": return item.annualRate;
-      case "status": return item.status === "active" ? "持有中" : item.status === "matured" ? "已到期" : "已取消";
+      case "status": return depositStatusLabel(item.status);
     }
   }), [data.deposits, depositSort]);
   const productHeader = (label: string, key: ProductSortKey) => <SortableHeader label={label} active={productSort.key === key} direction={productSort.direction} onSort={() => setProductSort((current) => toggleSort(current, key))} />;
@@ -1257,7 +1344,7 @@ function MasterDataView({ data, onEdit }: { data: MasterData; onEdit: (target: E
       <div className="panel-header"><div><h2>资料管理</h2><span>修改会自动备份并保留变更审计；手工修正不会被下次导入覆盖</span></div><div className="segmented"><button className={section === "products" ? "active" : ""} onClick={() => setSection("products")}>产品 {data.products.length}</button><button className={section === "accounts" ? "active" : ""} onClick={() => setSection("accounts")}>账户 {data.accounts.length}</button><button className={section === "deposits" ? "active" : ""} onClick={() => setSection("deposits")}>存款 {data.deposits.length}</button></div></div>
       {section === "products" && <div className="table-scroll"><table className="product-table"><thead><tr>{productHeader("名称", "name")}{productHeader("代码", "code")}{productHeader("币种", "currency")}{productHeader("发行机构", "issuer")}{productHeader("购买银行", "purchaseBanks")}{productHeader("风险等级", "riskLevel")}{productHeader("来源", "source")}<th /></tr></thead><tbody>{sortedProducts.map((item) => <tr key={item.id}><td><strong>{item.name}</strong></td><td className="product-code">{item.code}</td><td>{item.currency}</td><td>{item.issuer ?? "—"}</td><td className="purchase-banks">{item.purchaseBanks.length ? item.purchaseBanks.join("、") : "—"}</td><td>{item.riskLevel ?? "—"}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "product", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
       {section === "accounts" && <div className="table-scroll"><table><thead><tr>{accountHeader("账户", "account")}{accountHeader("币种", "currency")}{accountHeader("来源", "source")}<th /></tr></thead><tbody>{sortedAccounts.map((item) => <tr key={item.id}><td><strong>{item.institution}</strong><span>{item.name}</span></td><td>{item.currency}</td><td>{item.source === "excel" ? "Excel" : "手工"}</td><td><button className="icon-button" onClick={() => onEdit({ entityType: "account", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
-      {section === "deposits" && <div className="table-scroll"><table className="deposit-table"><thead><tr>{depositHeader("存款", "name")}{depositHeader("账户", "institution")}{depositHeader("币种", "currency")}{depositHeader("本金", "principal", "number")}{depositHeader("到期日", "maturityDate")}{depositHeader("年利率", "annualRate")}{depositHeader("状态", "status")}<th /></tr></thead><tbody>{sortedDeposits.map((item) => <tr key={item.id}><td><strong>{item.name}</strong><span>{item.source === "excel" ? "Excel 导入" : "手工录入"}</span></td><td>{item.institution}</td><td>{item.currency}</td><td className="number">{formatMoney(item.principal, item.currency)}</td><td>{item.maturityDate}</td><td>{formatPercent(item.annualRate)}</td><td><span className="status">{item.status === "active" ? "持有中" : item.status === "matured" ? "已到期" : "已取消"}</span></td><td><button className="icon-button" onClick={() => onEdit({ entityType: "deposit", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
+      {section === "deposits" && <div className="table-scroll"><table className="deposit-table"><thead><tr>{depositHeader("存款", "name")}{depositHeader("账户", "institution")}{depositHeader("币种", "currency")}{depositHeader("本金", "principal", "number")}{depositHeader("到期日", "maturityDate")}{depositHeader("年利率", "annualRate")}{depositHeader("状态", "status")}<th /></tr></thead><tbody>{sortedDeposits.map((item) => <tr key={item.id}><td><strong>{item.name}</strong><span>{item.source === "excel" ? "Excel 导入" : "手工录入"}</span></td><td>{item.institution}</td><td>{item.currency}</td><td className="number">{formatMoney(item.principal, item.currency)}</td><td>{item.maturityDate}</td><td>{formatPercent(item.annualRate)}</td><td><span className="status">{depositStatusLabel(item.status)}</span></td><td><button className="icon-button" onClick={() => onEdit({ entityType: "deposit", record: item })} aria-label={`编辑${item.name}`}><Pencil /></button></td></tr>)}</tbody></table></div>}
     </article>
   );
 }

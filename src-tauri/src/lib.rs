@@ -292,6 +292,8 @@ struct DepositRecord {
     maturity_date: String,
     annual_rate: f64,
     status: String,
+    matured_at: Option<String>,
+    proceeds: Option<f64>,
     source: String,
 }
 
@@ -901,6 +903,24 @@ fn normalize_existing_product_metadata(conn: &Connection) -> rusqlite::Result<()
         )?;
     }
     Ok(())
+}
+
+fn sync_deposit_statuses_for_date(conn: &Connection, today: NaiveDate) -> Result<usize, String> {
+    let today = today.format("%Y-%m-%d").to_string();
+    conn.execute(
+        "UPDATE deposits
+         SET status = 'active'
+         WHERE status = 'matured' AND matured_at IS NULL AND maturity_date > ?1",
+        [&today],
+    )
+    .map_err(|error| error.to_string())?;
+    conn.execute(
+        "UPDATE deposits
+         SET status = 'matured'
+         WHERE status = 'active' AND maturity_date <= ?1",
+        [&today],
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn ensure_column(
@@ -2008,14 +2028,14 @@ fn apply_entry(conn: &mut Connection, input: &EntryInput) -> Result<EntryResult,
             let deposit = input
                 .deposit_id
                 .ok_or_else(|| "请选择到期存款".to_string())?;
-            let (account, currency, principal, status): (i64, String, f64, String) = tx
+            let (account, currency, principal, status, matured_at): (i64, String, f64, String, Option<String>) = tx
                 .query_row(
-                    "SELECT account_id, currency, principal, status FROM deposits WHERE id = ?1",
+                    "SELECT account_id, currency, principal, status, matured_at FROM deposits WHERE id = ?1",
                     params![deposit],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
                 .map_err(|_| "没有找到所选存款".to_string())?;
-            if status != "active" {
+            if status != "active" && !(status == "matured" && matured_at.is_none()) {
                 return Err("该存款已经结清".to_string());
             }
             let proceeds = positive_amount(input.amount, "到账金额")?;
@@ -3074,7 +3094,7 @@ fn export_excel(conn: &Connection, target: &Path) -> Result<(), String> {
             .prepare(
                 "SELECT d.name, a.institution, d.currency, d.principal, d.start_date,
                         d.maturity_date, d.annual_rate,
-                        CASE d.status WHEN 'active' THEN '有效' WHEN 'matured' THEN '已到期'
+                        CASE d.status WHEN 'active' THEN '有效' WHEN 'matured' THEN '已取出'
                              WHEN 'cancelled' THEN '已取消' ELSE d.status END,
                         d.matured_at, d.proceeds
                  FROM deposits d JOIN accounts a ON a.id = d.account_id
@@ -3490,7 +3510,7 @@ fn export_excel(conn: &Connection, target: &Path) -> Result<(), String> {
         write_export_heading(
             sheet,
             "定期存款",
-            "包含有效、已到期和已取消记录",
+            "包含有效、已取出和已取消记录",
             9,
             &heading_formats,
             &headers,
@@ -3744,7 +3764,8 @@ fn list_master_data_from_conn(conn: &Connection) -> Result<MasterData, String> {
         let mut statement = conn
             .prepare(
                 "SELECT d.id, d.account_id, a.institution, d.name, d.currency, d.principal,
-                        d.start_date, d.maturity_date, d.annual_rate, d.status, d.source
+                        d.start_date, d.maturity_date, d.annual_rate, d.status,
+                        d.matured_at, d.proceeds, d.source
                  FROM deposits d JOIN accounts a ON a.id = d.account_id
                  ORDER BY d.status, d.maturity_date, d.id",
             )
@@ -3762,7 +3783,9 @@ fn list_master_data_from_conn(conn: &Connection) -> Result<MasterData, String> {
                     maturity_date: row.get(7)?,
                     annual_rate: row.get(8)?,
                     status: row.get(9)?,
-                    source: row.get(10)?,
+                    matured_at: row.get(10)?,
+                    proceeds: row.get(11)?,
+                    source: row.get(12)?,
                 })
             })
             .map_err(|error| error.to_string())?
@@ -3991,7 +4014,7 @@ fn reconciliation_center_from_conn(conn: &Connection) -> Result<ReconciliationCe
                 detail: format!(
                     "{institution} · 到期日 {maturity}；补全后才能纳入准确的期限收益分析"
                 ),
-                target_view: "masterData".to_string(),
+                target_view: "deposits".to_string(),
                 target_id: Some(id),
             });
         }
@@ -5340,6 +5363,15 @@ fn export_excel_file(
 }
 
 #[tauri::command]
+fn sync_deposit_statuses(state: State<'_, AppState>) -> Result<usize, String> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| "数据库正在使用中".to_string())?;
+    sync_deposit_statuses_for_date(&conn, Local::now().date_naive())
+}
+
+#[tauri::command]
 fn list_master_data(state: State<'_, AppState>) -> Result<MasterData, String> {
     let conn = state
         .db
@@ -6220,6 +6252,9 @@ pub fn run() {
             if let Err(error) = ensure_daily_backup(&conn, &backup_dir) {
                 eprintln!("daily backup failed: {error}");
             }
+            if let Err(error) = sync_deposit_statuses_for_date(&conn, Local::now().date_naive()) {
+                eprintln!("deposit status sync failed: {error}");
+            }
             match duplicate_manual_valuation_count(&conn) {
                 Ok(count) if count > 0 => {
                     match create_auto_backup(&conn, &backup_dir, "pre-valuation-deduplication") {
@@ -6271,6 +6306,7 @@ pub fn run() {
             backup_database,
             restore_database,
             export_excel_file,
+            sync_deposit_statuses,
             list_master_data,
             update_master_data,
             get_reconciliation_center,
@@ -6937,6 +6973,51 @@ mod tests {
             )
             .expect("matured status");
         assert_eq!(status, "matured");
+    }
+
+    #[test]
+    fn expired_deposits_are_automatically_marked_withdrawn() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        migrate(&conn).expect("migrate");
+        let mut expired = entry("DEPOSIT_OPEN", 100_000.0);
+        expired.product_name = Some("已到期定存".to_string());
+        expired.maturity_date = Some("2026-09-14".to_string());
+        apply_entry(&mut conn, &expired).expect("open expired deposit");
+        let mut future = entry("DEPOSIT_OPEN", 50_000.0);
+        future.product_name = Some("未到期定存".to_string());
+        future.maturity_date = Some("2026-09-15".to_string());
+        apply_entry(&mut conn, &future).expect("open future deposit");
+
+        let changed = sync_deposit_statuses_for_date(
+            &conn,
+            NaiveDate::from_ymd_opt(2026, 9, 14).expect("valid date"),
+        )
+        .expect("sync statuses");
+        assert_eq!(changed, 1);
+        let statuses: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT name, status, matured_at FROM deposits ORDER BY principal DESC")
+            .expect("prepare statuses")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query statuses")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect statuses");
+        assert_eq!(
+            statuses[0],
+            ("已到期定存".to_string(), "matured".to_string(), None)
+        );
+        assert_eq!(statuses[1].1, "active");
+
+        let expired_id: i64 = conn
+            .query_row(
+                "SELECT id FROM deposits WHERE name = '已到期定存'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("expired deposit id");
+        let mut settlement = entry("DEPOSIT_MATURITY", 102_000.0);
+        settlement.deposit_id = Some(expired_id);
+        let result = apply_entry(&mut conn, &settlement).expect("record actual proceeds later");
+        assert_eq!(result.realized_gain, Some(2_000.0));
     }
 
     #[test]

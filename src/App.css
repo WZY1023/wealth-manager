@@ -277,6 +277,19 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
 .master-panel .panel-header { align-items: flex-end; }
 .product-table { min-width: 900px; table-layout: fixed; }
 .deposit-table { min-width: 900px; }
+.deposit-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.deposit-metrics .metric-card > strong { font-size: 19px; }
+.deposit-filter { grid-template-columns: minmax(240px, 1fr) 125px 125px auto; }
+.deposit-filter > span { color: #748179; font-size: 10px; text-align: right; white-space: nowrap; }
+.deposit-overview-table { min-width: 1100px; }
+.deposit-overview-table td:first-child { min-width: 220px; }
+.deposit-overview-table td.number > span { display: block; margin-top: 3px; color: #728078; font-size: 9px; }
+.deposit-maturity-cell { white-space: nowrap; }
+.deposit-maturity-cell strong, .deposit-maturity-cell span { display: block; }
+.deposit-maturity-cell strong { font-weight: 500; }
+.deposit-maturity-cell span { margin-top: 3px; color: #728078; font-size: 9px; }
+.deposit-status-matured { background: #eef0f4; color: #58606d; }
+.deposit-status-cancelled { background: #f8ece8; color: #9a493b; }
 .product-table th:nth-child(2) { width: 180px; }
 .product-table th:nth-child(3) { width: 52px; }
 .product-table th:nth-child(4) { width: 82px; }
@@ -420,6 +433,9 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
   .analysis-metrics .metric-card:last-child { grid-column: auto; }
   .analysis-grid { grid-template-columns: 1fr; }
   .history-metrics { grid-template-columns: 1fr 1fr; }
+  .deposit-metrics { grid-template-columns: 1fr 1fr; }
+  .deposit-filter { grid-template-columns: 1fr 1fr; }
+  .deposit-filter .search-field { grid-column: 1 / -1; }
   .history-filter { grid-template-columns: 1fr 1fr; }
   .history-filter .search-field { grid-column: 1 / -1; }
   .holding-detail-metrics { grid-template-columns: 1fr 1fr; }
@@ -444,6 +460,10 @@ td:first-child span { display: block; color: #7b8981; font-size: 10px; margin-to
   .analysis-toolbar { align-items: flex-start; flex-direction: column; }
   .analysis-metrics { grid-template-columns: 1fr; }
   .history-metrics { grid-template-columns: 1fr; }
+  .deposit-metrics { grid-template-columns: 1fr; }
+  .deposit-filter { grid-template-columns: 1fr; }
+  .deposit-filter .search-field { grid-column: 1; }
+  .deposit-filter > span { text-align: left; }
   .history-filter { grid-template-columns: 1fr; }
   .history-filter .search-field { grid-column: 1; }
   .overview-metrics { grid-template-columns: 1fr; }
