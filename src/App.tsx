@@ -41,7 +41,7 @@ type SortDirection = "asc" | "desc";
 type SortState<Key extends string> = { key: Key; direction: SortDirection };
 type SortValue = string | number | boolean | null | undefined;
 
-type HoldingsSortKey = "productName" | "productCode" | "channel" | "cost" | "marketValue" | "gain" | "thirtyDayReturn" | "valuationDate" | "signal";
+type HoldingsSortKey = "productName" | "productCode" | "channel" | "holdingDays" | "cost" | "marketValue" | "gain" | "thirtyDayReturn" | "valuationDate" | "signal";
 type HistorySortKey = "productName" | "productCode" | "closeType" | "holdingDays" | "investedCost" | "proceeds" | "dividendFees" | "realizedGain" | "returnRate";
 type ProductSortKey = "name" | "code" | "currency" | "issuer" | "purchaseBanks" | "riskLevel" | "source";
 type AccountSortKey = "account" | "currency" | "source";
@@ -88,13 +88,16 @@ type Holding = {
   daysSinceValuation: number;
   sevenDayReturn: number | null;
   thirtyDayReturn: number | null;
+  longestHoldingDays: number | null;
+  shortestHoldingDays: number | null;
+  activeLotCount: number;
   signal: string;
   signalLabel: string;
   signalReason: string;
 };
 
 type ValuationHistoryPoint = { id: number; date: string; marketValue: number; changeAmount: number | null; changeRate: number | null; source: string };
-type HoldingDetail = Omit<Holding, "id" | "status"> & { riskLevel: string | null; history: ValuationHistoryPoint[] };
+type HoldingDetail = Omit<Holding, "id" | "status" | "longestHoldingDays" | "shortestHoldingDays" | "activeLotCount"> & { riskLevel: string | null; history: ValuationHistoryPoint[] };
 type ClosedPosition = {
   id: number;
   productId: number;
@@ -264,6 +267,10 @@ function formatMoney(value: number, currency: CurrencyCode) {
 
 function formatPercent(value: number) {
   return new Intl.NumberFormat("zh-CN", { style: "percent", maximumFractionDigits: 2 }).format(value);
+}
+
+function formatHoldingDays(value: number | null) {
+  return value === null ? "—" : `${value}天`;
 }
 
 const sortCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
@@ -923,6 +930,7 @@ function HoldingsView({ holdings, onBatchUpdate, onSelect, loading }: { holdings
       case "productName": return item.name;
       case "productCode": return item.code;
       case "channel": return item.channel;
+      case "holdingDays": return item.longestHoldingDays;
       case "cost": return item.cost;
       case "marketValue": return item.marketValue;
       case "gain": return item.gain;
@@ -937,8 +945,8 @@ function HoldingsView({ holdings, onBatchUpdate, onSelect, loading }: { holdings
     <article className="panel table-panel">
       <div className="panel-header holdings-header"><div><h2>当前持仓</h2><span>显示 {filtered.length}/{holdings.length} 个产品 · 点击持仓查看市值与收益历史</span></div><button className="button primary valuation-cta" type="button" onClick={onBatchUpdate}><Activity />批量更新市值</button></div>
       <div className="filter-bar holdings-filter"><label className="search-field"><Search /><input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索产品、代码或渠道" /></label><select value={currencyFilter} onChange={(event) => setCurrencyFilter(event.target.value)}><option value="all">全部币种</option><option value="CNY">人民币</option><option value="USD">美元</option></select><select value={channelFilter} onChange={(event) => setChannelFilter(event.target.value)}><option value="all">全部渠道</option>{channels.map((channel) => <option key={channel} value={channel}>{channel}</option>)}</select><select value={signalFilter} onChange={(event) => setSignalFilter(event.target.value)}><option value="all">全部参考</option><option value="stale">市值待更新</option><option value="REVIEW">评估赎回</option><option value="TAKE_PROFIT">考虑止盈</option><option value="ADD_WATCH">关注加仓</option><option value="HOLD">继续观察</option><option value="OBSERVE">积累数据</option></select></div>
-      <div className="table-scroll"><table className="holdings-table"><thead><tr><SortableHeader label="产品" active={productSortActive} direction={sort?.direction ?? "asc"} activeDetail={sort?.key === "productCode" ? "代码" : "名称"} onSort={() => setSort((current) => cycleProductSort(current, "productName", "productCode"))} /><SortableHeader label="渠道" active={sort?.key === "channel"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("channel")} /><SortableHeader label="成本" className="number" active={sort?.key === "cost"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("cost")} /><SortableHeader label="市值" className="number" active={sort?.key === "marketValue"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("marketValue")} /><SortableHeader label="持有收益" className="number" active={sort?.key === "gain"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("gain")} /><SortableHeader label="近30日" className="number" active={sort?.key === "thirtyDayReturn"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("thirtyDayReturn")} /><SortableHeader label="最近更新" active={sort?.key === "valuationDate"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("valuationDate")} /><SortableHeader label="操作参考" active={sort?.key === "signal"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("signal")} /></tr></thead><tbody>
-        {sorted.map((item) => <tr className="holding-row" aria-busy={loading} key={`${item.id}-${item.currency}`} onClick={() => onSelect(item)}><td><strong>{item.name}</strong><span>{item.code} · {item.currency}</span></td><td>{item.channel}</td><td className="number">{formatMoney(item.cost, item.currency)}</td><td className="number"><strong>{formatMoney(item.marketValue, item.currency)}</strong></td><td className={`number ${item.gain >= 0 ? "gain" : "loss"}`}>{formatMoney(item.gain, item.currency)}<span>{formatPercent(item.gainRate)}</span></td><td className={`number ${item.thirtyDayReturn === null ? "" : item.thirtyDayReturn >= 0 ? "gain" : "loss"}`}>{item.thirtyDayReturn === null ? "—" : formatPercent(item.thirtyDayReturn)}</td><td><span className={item.daysSinceValuation > 10 ? "stale-date" : "fresh-date"}>{item.valuationDate}</span><small>{item.daysSinceValuation === 0 ? "今天" : `${item.daysSinceValuation}天前`}</small></td><td><span className={`signal-badge signal-${item.signal.toLowerCase()}`}>{item.signalLabel}</span><small className="signal-summary">{item.signalReason}</small></td></tr>)}
+      <div className="table-scroll"><table className="holdings-table"><thead><tr><SortableHeader label="产品" active={productSortActive} direction={sort?.direction ?? "asc"} activeDetail={sort?.key === "productCode" ? "代码" : "名称"} onSort={() => setSort((current) => cycleProductSort(current, "productName", "productCode"))} /><SortableHeader label="渠道" active={sort?.key === "channel"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("channel")} /><SortableHeader label="持有期" active={sort?.key === "holdingDays"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("holdingDays")} /><SortableHeader label="成本" className="number" active={sort?.key === "cost"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("cost")} /><SortableHeader label="市值" className="number" active={sort?.key === "marketValue"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("marketValue")} /><SortableHeader label="持有收益" className="number" active={sort?.key === "gain"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("gain")} /><SortableHeader label="近30日" className="number" active={sort?.key === "thirtyDayReturn"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("thirtyDayReturn")} /><SortableHeader label="最近更新" active={sort?.key === "valuationDate"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("valuationDate")} /><SortableHeader label="操作参考" active={sort?.key === "signal"} direction={sort?.direction ?? "asc"} onSort={() => changeSort("signal")} /></tr></thead><tbody>
+        {sorted.map((item) => <tr className="holding-row" aria-busy={loading} key={`${item.id}-${item.currency}`} onClick={() => onSelect(item)}><td><strong>{item.name}</strong><span>{item.code} · {item.currency}</span></td><td>{item.channel}</td><td className="holding-period"><strong>最长 {formatHoldingDays(item.longestHoldingDays)}</strong><span>{item.shortestHoldingDays === null ? "批次日期待补全" : `最短 ${formatHoldingDays(item.shortestHoldingDays)} · ${item.activeLotCount}个批次`}</span></td><td className="number">{formatMoney(item.cost, item.currency)}</td><td className="number"><strong>{formatMoney(item.marketValue, item.currency)}</strong></td><td className={`number ${item.gain >= 0 ? "gain" : "loss"}`}>{formatMoney(item.gain, item.currency)}<span>{formatPercent(item.gainRate)}</span></td><td className={`number ${item.thirtyDayReturn === null ? "" : item.thirtyDayReturn >= 0 ? "gain" : "loss"}`}>{item.thirtyDayReturn === null ? "—" : formatPercent(item.thirtyDayReturn)}</td><td><span className={item.daysSinceValuation > 10 ? "stale-date" : "fresh-date"}>{item.valuationDate}</span><small>{item.daysSinceValuation === 0 ? "今天" : `${item.daysSinceValuation}天前`}</small></td><td><span className={`signal-badge signal-${item.signal.toLowerCase()}`}>{item.signalLabel}</span><small className="signal-summary">{item.signalReason}</small></td></tr>)}
       </tbody></table></div>
       <div className="advice-disclaimer"><Sparkles />操作参考仅根据你记录的估值、收益、产品风险等级和持仓占比生成；历史表现不能预测未来，请同时核对期限、赎回规则、费用和个人风险承受能力。</div>
     </article>

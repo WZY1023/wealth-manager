@@ -61,6 +61,9 @@ struct Holding {
     days_since_valuation: i64,
     seven_day_return: Option<f64>,
     thirty_day_return: Option<f64>,
+    longest_holding_days: Option<i64>,
+    shortest_holding_days: Option<i64>,
+    active_lot_count: i64,
     signal: String,
     signal_label: String,
     signal_reason: String,
@@ -5611,7 +5614,8 @@ fn list_holdings(state: State<'_, AppState>) -> Result<Vec<Holding>, String> {
         .prepare(
             "SELECT v.id, p.id, a.id, p.name, p.code, v.currency, a.institution,
                     COALESCE(SUM(COALESCE(l.remaining_amount, l.original_amount)), 0) AS cost,
-                    v.market_value, v.valuation_date
+                    v.market_value, v.valuation_date,
+                    MIN(l.purchase_date), MAX(l.purchase_date), COUNT(l.id)
              FROM valuations v
              JOIN products p ON p.id = v.product_id
              JOIN accounts a ON a.id = v.account_id
@@ -5626,6 +5630,11 @@ fn list_holdings(state: State<'_, AppState>) -> Result<Vec<Holding>, String> {
             let cost: f64 = row.get(7)?;
             let market_value: f64 = row.get(8)?;
             let gain = market_value - cost;
+            let today = Local::now().date_naive();
+            let holding_days = |date: Option<String>| {
+                date.and_then(|value| NaiveDate::parse_from_str(&value, "%Y-%m-%d").ok())
+                    .map(|value| today.signed_duration_since(value).num_days().max(0))
+            };
             Ok(Holding {
                 id: row.get(0)?,
                 product_id: row.get(1)?,
@@ -5647,6 +5656,9 @@ fn list_holdings(state: State<'_, AppState>) -> Result<Vec<Holding>, String> {
                 days_since_valuation: 0,
                 seven_day_return: None,
                 thirty_day_return: None,
+                longest_holding_days: holding_days(row.get(10)?),
+                shortest_holding_days: holding_days(row.get(11)?),
+                active_lot_count: row.get(12)?,
                 signal: String::new(),
                 signal_label: String::new(),
                 signal_reason: String::new(),
